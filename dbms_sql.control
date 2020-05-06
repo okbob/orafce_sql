@@ -1,0 +1,4 @@
+comment = 'Functions and operators that emulate dbms_sql package''s API'
+default_version = '1.0'
+module_pathname = '$libdir/dbms_sql'
+relocatable = false
