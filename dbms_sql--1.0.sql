@@ -10,8 +10,6 @@ CREATE SCHEMA dbms_sql;
 CREATE DOMAIN varchar2 AS text;
 
 /*
-CREATE FUNCTION dbms_sql.open_cursor() RETURNS int;
-CREATE PROCEDURE dbms_sql.parse(c int, statement varchar);
 CREATE PROCEDURE dbms_sql.bind_variable(c int, name varchar2, value "any");
 CREATE PROCEDURE dbms_sql.define_column(c int, pos int, value "any", int size default -1);
 CREATE PROCEDURE dbms_sql.column_value(c int, pos int, INOUT value "any");
@@ -20,15 +18,18 @@ CREATE FUNCTION dbms_sql.execute(c int) RETURNS bigint;
 CREATE FUNCTION dbms_sql.fetch_row(c int) RETURNS int;
 
 
-
-CREATE PROCEDURE dbms_sql.close_cursor(c int);
-
 */
 
-CREATE PROCEDURE dbms_sql.parse(c int, stmt varchar2)
-AS 'MODULE_PATHNAME', 'dbms_sql_parse'
-LANGUAGE C;
+CREATE FUNCTION dbms_sql.open_cursor() RETURNS int AS 'MODULE_PATHNAME', 'dbms_sql_open_cursor' LANGUAGE C;
+CREATE PROCEDURE dbms_sql.close_cursor(c int) AS 'MODULE_PATHNAME', 'dbms_sql_close_cursor' LANGUAGE C;
+CREATE PROCEDURE dbms_sql.debug_cursor(c int) AS 'MODULE_PATHNAME', 'dbms_sql_debug_cursor' LANGUAGE C;
+CREATE PROCEDURE dbms_sql.parse(c int, stmt varchar2) AS 'MODULE_PATHNAME', 'dbms_sql_parse' LANGUAGE C;
+CREATE PROCEDURE dbms_sql.bind_variable(c int, name varchar2, value "any") AS 'MODULE_PATHNAME', 'dbms_sql_bind_variable' LANGUAGE C;
+CREATE PROCEDURE dbms_sql.define_column(c int, col int, value "any", size int DEFAULT -1) AS 'MODULE_PATHNAME', 'dbms_sql_define_column' LANGUAGE C;
+CREATE FUNCTION dbms_sql.execute(c int) RETURNS bigint AS 'MODULE_PATHNAME', 'dbms_sql_execute' LANGUAGE C;
 
+COMMENT ON FUNCTION dbms_sql.open_cursor() IS 'returns first handler of dbms_sql''s cursor';
 COMMENT ON PROCEDURE dbms_sql.parse(int, varchar2) IS 'prepare sql statement';
+COMMENT ON PROCEDURE dbms_sql.bind_variable(int, varchar2, "any") IS 'assign a value to bind variable';
 
 
