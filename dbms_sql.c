@@ -154,7 +154,6 @@ get_cursor(FunctionCallInfo fcinfo, bool should_be_assigned)
 	return cursor;
 }
 
-
 /*
  * PROCEDURE dbms_sql.close_cursor(c int)
  */
@@ -226,6 +225,8 @@ dbms_sql_debug_cursor(PG_FUNCTION_ARGS)
 
 
 	}
+
+elog(NOTICE, "%d %d", TopTransactionContext, CurTransactionContext);
 
 	return (Datum) 0;
 }
@@ -445,7 +446,6 @@ get_col(CursorData *c, int position, bool append)
 	else
 		elog(ERROR, "column definition on position \"%d\" not found", position);
 }
-
 
 /*
  * CREATE PROCEDURE dbms_sql.define_column(c int, col int, value "any", scale int DEFAULT -1);
