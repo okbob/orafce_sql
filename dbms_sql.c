@@ -2,6 +2,7 @@
 #include "fmgr.h"
 
 #include "catalog/pg_type_d.h"
+#include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 #include "parser/parse_coerce.h"
@@ -63,6 +64,7 @@ typedef struct
 	char		cursorname[32];
 	MemoryContext cursor_cxt;
 	bool		assigned;
+	bool		executed;
 } CursorData;
 
 typedef enum
@@ -77,6 +79,7 @@ typedef enum
 	TOKEN_IDENTIF,
 	TOKEN_QIDENTIF,
 	TOKEN_OTHER,
+	TOKEN_NONE
 } TokenType;
 
 static MemoryContext	persist_cxt;
@@ -222,11 +225,7 @@ dbms_sql_debug_cursor(PG_FUNCTION_ARGS)
 		elog(NOTICE, "column definotion for position %d is %s",
 					  col->position,
 					  format_type_with_typemod(col->typoid, col->typmod));
-
-
 	}
-
-elog(NOTICE, "%d %d", TopTransactionContext, CurTransactionContext);
 
 	return (Datum) 0;
 }
@@ -303,7 +302,7 @@ dbms_sql_parse(PG_FUNCTION_ARGS)
 		size_t		seplen;
 
 		next_ptr = next_token(ptr, &start, &len, &typ, &startsep, &seplen);
-		if (ptr)
+		if (next_ptr)
 		{
 			if (typ == TOKEN_DOLAR_STR)
 			{
@@ -332,7 +331,7 @@ dbms_sql_parse(PG_FUNCTION_ARGS)
 			{
 				appendStringInfo(&sinfo, "\"%.*s\"", (int) len, start);
 			}
-			else
+			else if (typ != TOKEN_NONE)
 				appendStringInfo(&sinfo, "%.*s", (int) len, start);
 		}
 
@@ -505,11 +504,9 @@ Datum
 dbms_sql_execute(PG_FUNCTION_ARGS)
 {
 	CursorData *c;
-	ColumnData *col;
 	StringInfoData sinfo;
 
 	c = get_cursor(fcinfo, true);
-
 
 	/*
 	 * When column definitions are available, build final query
@@ -517,25 +514,64 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 	 */
 	if (c->columns)
 	{
+		Datum	   *values;
+		Oid		   *types;
+		char *nulls;
+		ListCell   *lc;
 		int		i;
 
 		initStringInfo(&sinfo);
 
-		appendStringInfo(&sinfo, "with __orafce_dbms_sql_cursor_%d as (%s) select ", c->cid, c->parsed_query);
+		/* prepare query arguments */
+		values = palloc(sizeof(Datum) * c->nvariables);
+		types = palloc(sizeof(Oid) * c->nvariables);
+		nulls = palloc(sizeof(char) * c->nvariables);
 
-		for (i = 1; i < c->max_colpos; i++)
+		i = 0;
+		foreach(lc, c->variables)
 		{
-			ColumnData *col = get_col(c, i, false);
+			VariableData *var = (VariableData *) lfirst(lc);
 
-			if (i > 1)
-				appendStringInfoString(&sinfo, ", ");
+			if (!var->isnull)
+			{
+				values[i] = var->value;
+				nulls[i] = ' ';
+			}
+			else
+				nulls[i] = 'n';
 
-			
+			if (var->typoid == InvalidOid)
+				elog(ERROR, "variable \"%s\" has not bind a value", var->refname);
 
-			
+			types[i] = var->typoid;
 		}
 
+		if (!c->executed)
+		{
+			Portal		portal;
 
+			snprintf(c->cursorname, sizeof(c->cursorname), "__orafce_dbms_sql_cursor_%d", c->cid);
+
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connact failed");
+
+			portal = SPI_cursor_open_with_args(c->cursorname,
+											   c->parsed_query,
+											   c->nvariables,
+											   types,
+											   values,
+											   nulls,
+											   false,
+											   0);
+
+			if (portal == NULL)
+				elog(ERROR, "could not open cursor for query \"%s\": %s",
+					  c->parsed_query, SPI_result_code_string(SPI_result));
+
+			SPI_finish();
+
+			c->executed = true;
+		}
 	}
 
 	PG_RETURN_INT64(0);
@@ -572,7 +608,10 @@ static char *
 next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, size_t *seplen)
 {
 	if (*str == '\0')
+	{
+		*typ = TOKEN_NONE;
 		return NULL;
+	}
 
 	/* reduce spaces */
 	if (*str == ' ')
@@ -784,7 +823,6 @@ next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, siz
 	}
 
 	/* Others */
-	*typ = TOKEN_OTHER;
-	*start = str;
+	*typ = TOKEN_OTHER; *start = str; *len = 1;
 	return str + 1;
 }
