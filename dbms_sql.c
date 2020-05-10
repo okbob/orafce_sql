@@ -139,6 +139,17 @@ _PG_init(void)
 										ALLOCSET_DEFAULT_SIZES);
 }
 
+static void
+open_cursor(CursorData *c, int cid)
+{
+	c->cid = cid;
+
+	c->cursor_cxt = AllocSetContextCreate(persist_cxt,
+														   "dbms_sql cursor context",
+														   ALLOCSET_DEFAULT_SIZES);
+	c->assigned = true;
+}
+
 /*
  * FUNCTION dbms_sql.open_cursor() RETURNS int
  */
@@ -154,14 +165,7 @@ dbms_sql_open_cursor(PG_FUNCTION_ARGS)
 	{
 		if (!cursors[i].assigned)
 		{
-			memset(&cursors[i], 0, sizeof(CursorData));
-
-			cursors[i].cid = i;
-
-			cursors[i].cursor_cxt = AllocSetContextCreate(persist_cxt,
-														   "dbms_sql cursor context",
-														   ALLOCSET_DEFAULT_SIZES);
-			cursors[i].assigned = true;
+			open_cursor(&cursors[i], i);
 
 			return i;
 		}
@@ -190,6 +194,22 @@ get_cursor(FunctionCallInfo fcinfo, bool should_be_assigned)
 	return cursor;
 }
 
+static void
+close_cursor(CursorData *c)
+{
+	if (c->executed && c->portal)
+		SPI_cursor_close(c->portal);
+
+	/* release all assigned memory */
+	if (c->cursor_cxt)
+		MemoryContextDelete(c->cursor_cxt);
+
+	if (c->cursor_xact_cxt)
+		MemoryContextDelete(c->cursor_xact_cxt);
+
+	memset(c, 0, sizeof(CursorData));
+}
+
 /*
  * PROCEDURE dbms_sql.close_cursor(c int)
  */
@@ -200,14 +220,7 @@ dbms_sql_close_cursor(PG_FUNCTION_ARGS)
 
 	c = get_cursor(fcinfo, false);
 
-	/* release all assigned memory */
-	if (c->assigned)
-		MemoryContextDelete(c->cursor_cxt);
-
-	if (c->cursor_xact_cxt)
-		MemoryContextDelete(c->cursor_xact_cxt);
-
-	c->assigned = false;
+	close_cursor(c);
 
 	return (Datum) 0;
 }
@@ -325,7 +338,12 @@ dbms_sql_parse(PG_FUNCTION_ARGS)
 		elog(ERROR, "parsed query cannot be NULL");
 
 	if (c->parsed_query)
-		elog(ERROR, "cursor has assigned parsed query already");
+	{
+		int		cid = c->cid;
+
+		close_cursor(c);
+		open_cursor(c, cid);
+	}
 
 	query = text_to_cstring(PG_GETARG_TEXT_P(1));
 	ptr = query;
@@ -369,7 +387,9 @@ dbms_sql_parse(PG_FUNCTION_ARGS)
 				appendStringInfo(&sinfo, "\"%.*s\"", (int) len, start);
 			}
 			else if (typ != TOKEN_NONE)
+			{
 				appendStringInfo(&sinfo, "%.*s", (int) len, start);
+			}
 		}
 
 		ptr = next_ptr;
@@ -424,7 +444,12 @@ dbms_sql_bind_variable(PG_FUNCTION_ARGS)
 	}
 
 	if (var->typoid != InvalidOid)
-		elog(WARNING, "bind variable is assigned already");
+	{
+		if (!var->typbyval)
+			pfree(DatumGetPointer(var->value));
+
+		var->isnull = true;
+	}
 
 	var->typoid = valtype;
 
@@ -603,6 +628,8 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 		int		i;
 		MemoryContext oldcxt;
 
+		oldcxt = MemoryContextSwitchTo(c->cursor_xact_cxt);
+
 		/* prepare query arguments */
 		values = palloc(sizeof(Datum) * c->nvariables);
 		types = palloc(sizeof(Oid) * c->nvariables);
@@ -615,7 +642,8 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 
 			if (!var->isnull)
 			{
-				values[i] = var->value;
+				/* copy a value to xact memory context, to be independent on a outside */
+				values[i] = datumCopy(var->value, var->typbyval, var->typlen);
 				nulls[i] = ' ';
 			}
 			else
@@ -631,7 +659,6 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 		if (c->tupdesc)
 			FreeTupleDesc(c->tupdesc);
 
-		oldcxt = MemoryContextSwitchTo(c->cursor_xact_cxt);
 
 		c->coltupdesc = CreateTemplateTupleDesc(c->max_colpos);
 
@@ -854,10 +881,12 @@ dbms_sql_column_value(PG_FUNCTION_ARGS)
 	if (pos < 1 && pos > c->coltupdesc->natts)
 		elog(ERROR, "position is out of [1, %d]", c->coltupdesc->natts);
 
-	/* Setting of OUT field is little bit more complex */
+	/*
+	 * Setting of OUT field is little bit more complex, because although
+	 * there is only one output field, the result should be compisite type.
+	 */
 	if (get_call_result_type(fcinfo, &resultTypeId, &resulttupdesc) == TYPEFUNC_COMPOSITE)
 	{
-
 		/* check target types */
 		if (resulttupdesc->natts != 1)
 			elog(ERROR, "unexpected number of result compisite fields");
@@ -930,7 +959,8 @@ dbms_sql_column_value(PG_FUNCTION_ARGS)
 
 
 /******************************************************************
- * Simple parser
+ * Simple parser - just for replacement of bind variables by
+ * PostgreSQL $ param placeholders.
  *
  ******************************************************************
  */
