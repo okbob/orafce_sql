@@ -1,6 +1,8 @@
 #include "postgres.h"
 #include "fmgr.h"
+#include "funcapi.h"
 
+#include "access/tupconvert.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
@@ -47,7 +49,24 @@ typedef struct
 	bool		typbyval;
 	int16		typlen;
 	int32		typmod;
+	bool		typisstr;
 } ColumnData;
+
+typedef struct
+{
+	bool		isvalid;			/* true, when this cast can be used */
+	bool		without_cast;		/* true, when cast is not necessary */
+	Oid		funcoid;
+	Oid		funcoid_typmod;
+	CoercionPathType path;
+	CoercionPathType path_typmod;
+	FmgrInfo	finfo;
+	FmgrInfo	finfo_typmod;
+	FmgrInfo	finfo_out;
+	FmgrInfo	finfo_in;
+	Oid			typIOParam;
+	bool		check_domain;
+} CastCacheData;
 
 /*
  * dbms_sql cursor definition
@@ -62,7 +81,16 @@ typedef struct
 	List	   *variables;
 	List	   *columns;
 	char		cursorname[32];
+	Portal		portal;
 	MemoryContext cursor_cxt;
+	MemoryContext cursor_xact_cxt;
+	MemoryContext tuples_cxt;
+	HeapTuple	tuples[1000];
+	TupleDesc	coltupdesc;
+	TupleDesc	tupdesc;
+	CastCacheData *casts;
+	int			processed;
+	int			nread;
 	bool		assigned;
 	bool		executed;
 } CursorData;
@@ -78,6 +106,7 @@ typedef enum
 	TOKEN_DOLAR_STR,
 	TOKEN_IDENTIF,
 	TOKEN_QIDENTIF,
+	TOKEN_DOUBLE_COLON,
 	TOKEN_OTHER,
 	TOKEN_NONE
 } TokenType;
@@ -93,6 +122,8 @@ PG_FUNCTION_INFO_V1(dbms_sql_parse);
 PG_FUNCTION_INFO_V1(dbms_sql_bind_variable);
 PG_FUNCTION_INFO_V1(dbms_sql_define_column);
 PG_FUNCTION_INFO_V1(dbms_sql_execute);
+PG_FUNCTION_INFO_V1(dbms_sql_fetch_rows);
+PG_FUNCTION_INFO_V1(dbms_sql_column_value);
 
 PG_FUNCTION_INFO_V1(dbms_sql_debug_cursor);
 
@@ -103,7 +134,7 @@ _PG_init(void)
 {
 	memset(cursors, 0, sizeof(cursors));
 
-	persist_cxt = AllocSetContextCreate(TopMemoryContext,
+	persist_cxt = AllocSetContextCreate(NULL,
 										"dbms_sql persist context",
 										ALLOCSET_DEFAULT_SIZES);
 }
@@ -115,6 +146,8 @@ Datum
 dbms_sql_open_cursor(PG_FUNCTION_ARGS)
 {
 	int		i;
+
+	(void) fcinfo;
 
 	/* find and initialize first free slot */
 	for (i = 0; i < MAX_CURSORS; i++)
@@ -171,6 +204,9 @@ dbms_sql_close_cursor(PG_FUNCTION_ARGS)
 	if (c->assigned)
 		MemoryContextDelete(c->cursor_cxt);
 
+	if (c->cursor_xact_cxt)
+		MemoryContextDelete(c->cursor_xact_cxt);
+
 	c->assigned = false;
 
 	return (Datum) 0;
@@ -222,7 +258,7 @@ dbms_sql_debug_cursor(PG_FUNCTION_ARGS)
 	{
 		ColumnData *col = (ColumnData *) lfirst(lc);
 
-		elog(NOTICE, "column definotion for position %d is %s",
+		elog(NOTICE, "column definition for position %d is %s",
 					  col->position,
 					  format_type_with_typemod(col->typoid, col->typmod));
 	}
@@ -255,6 +291,7 @@ get_var(CursorData *c, char *refname, int position, bool append)
 
 		nvar->refname = pstrdup(refname);
 		nvar->varno = c->nvariables + 1;
+		nvar->position = position;
 
 		c->variables = lappend(c->variables, nvar);
 		c->nvariables += 1;
@@ -487,14 +524,28 @@ dbms_sql_define_column(PG_FUNCTION_ARGS)
 	colsize = PG_GETARG_INT32(3);
 
 	get_type_category_preferred(col->typoid, &category, &ispreferred);
-	if (category == TYPCATEGORY_STRING)
-		col->typmod = colsize != -1 ? colsize + 4 : -1;
-	else
-		col->typmod = -1;
+	col->typisstr = category == TYPCATEGORY_STRING;
+	col->typmod = (col->typisstr && colsize != -1) ? colsize + 4 : -1;
 
 	get_typlenbyval(col->typoid, &col->typlen, &col->typbyval);
 
 	return (Datum) 0;
+}
+
+static void
+cursor_xact_cxt_deletion_callback(void *arg)
+{
+	CursorData *cur = (CursorData *) arg;
+
+	cur->cursor_xact_cxt = NULL;
+	cur->tuples_cxt = NULL;
+
+	cur->processed = 0;
+	cur->nread = 0;
+	cur->executed = false;
+	cur->tupdesc = NULL;
+	cur->coltupdesc = NULL;
+	cur->casts = NULL;
 }
 
 /*
@@ -504,9 +555,40 @@ Datum
 dbms_sql_execute(PG_FUNCTION_ARGS)
 {
 	CursorData *c;
-	StringInfoData sinfo;
 
 	c = get_cursor(fcinfo, true);
+
+	/* clean space with saved result */
+	if (!c->cursor_xact_cxt)
+	{
+		MemoryContextCallback *mcb;
+		MemoryContext oldcxt;
+
+		c->cursor_xact_cxt = AllocSetContextCreate(TopTransactionContext,
+															   "dbms_sql persist context",
+															   ALLOCSET_DEFAULT_SIZES);
+
+		oldcxt = MemoryContextSwitchTo(c->cursor_xact_cxt);
+		mcb = palloc0(sizeof(MemoryContextCallback));
+
+		mcb->func = cursor_xact_cxt_deletion_callback;
+		mcb->arg = c;
+
+		MemoryContextRegisterResetCallback(c->cursor_xact_cxt, mcb);
+
+		MemoryContextSwitchTo(oldcxt);
+	}
+	else
+	{
+		MemoryContext	save_cxt = c->cursor_xact_cxt;
+
+		MemoryContextReset(c->cursor_xact_cxt);
+		c->cursor_xact_cxt = save_cxt;
+
+		c->casts = NULL;
+		c->tupdesc = NULL;
+		c->tuples_cxt = NULL;
+	}
 
 	/*
 	 * When column definitions are available, build final query
@@ -519,8 +601,7 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 		char *nulls;
 		ListCell   *lc;
 		int		i;
-
-		initStringInfo(&sinfo);
+		MemoryContext oldcxt;
 
 		/* prepare query arguments */
 		values = palloc(sizeof(Datum) * c->nvariables);
@@ -546,35 +627,305 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 			types[i] = var->typoid;
 		}
 
-		if (!c->executed)
+		/* prepare or refresh target tuple descriptor, used for final tupconversion */
+		if (c->tupdesc)
+			FreeTupleDesc(c->tupdesc);
+
+		oldcxt = MemoryContextSwitchTo(c->cursor_xact_cxt);
+
+		c->coltupdesc = CreateTemplateTupleDesc(c->max_colpos);
+
+		/* prepare current result column tupdesc */
+		for (i = 1; i <= c->max_colpos; i++)
 		{
-			Portal		portal;
+			ColumnData *col = get_col(c, i, false);
+			char genname[32];
 
-			snprintf(c->cursorname, sizeof(c->cursorname), "__orafce_dbms_sql_cursor_%d", c->cid);
-
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connact failed");
-
-			portal = SPI_cursor_open_with_args(c->cursorname,
-											   c->parsed_query,
-											   c->nvariables,
-											   types,
-											   values,
-											   nulls,
-											   false,
-											   0);
-
-			if (portal == NULL)
-				elog(ERROR, "could not open cursor for query \"%s\": %s",
-					  c->parsed_query, SPI_result_code_string(SPI_result));
-
-			SPI_finish();
-
-			c->executed = true;
+			snprintf(genname, 32, "col%d", i);
+			TupleDescInitEntry(c->coltupdesc, (AttrNumber) i, genname, col->typoid, col->typmod, 0);
 		}
+
+		c->casts = palloc0(sizeof(CastCacheData) * c->coltupdesc->natts);
+
+		MemoryContextSwitchTo(oldcxt);
+
+		snprintf(c->cursorname, sizeof(c->cursorname), "__orafce_dbms_sql_cursor_%d", c->cid);
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connact failed");
+
+		c->portal = SPI_cursor_open_with_args(c->cursorname,
+											  c->parsed_query,
+											  c->nvariables,
+											  types,
+											  values,
+											  nulls,
+											  false,
+											  0);
+
+		if (c->portal == NULL)
+			elog(ERROR, "could not open cursor for query \"%s\": %s",
+				  c->parsed_query, SPI_result_code_string(SPI_result));
+
+		SPI_finish();
+
+		/* Describe portal and prepare cast cache */
+		if (c->portal->tupDesc)
+		{
+			int		natts = 0;
+			TupleDesc tupdesc = c->portal->tupDesc;
+
+			for (i = 0; i < tupdesc->natts; i++)
+			{
+				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+				if (att->attisdropped)
+					continue;
+
+				natts += 1;
+			}
+
+			if (natts != c->coltupdesc->natts)
+				elog(ERROR, "returned query has different number of columns than number of defined columns");
+		}
+
+		c->executed = true;
 	}
 
 	PG_RETURN_INT64(0);
+}
+
+/*
+ * CREATE FUNCTION dbms_sql.fetch_rows(c int) RETURNS int;
+ */
+Datum
+dbms_sql_fetch_rows(PG_FUNCTION_ARGS)
+{
+	CursorData *c;
+
+	c = get_cursor(fcinfo, true);
+
+	if (!c->executed)
+		elog(ERROR, "cursor is not executed");
+
+	if (!c->portal)
+		elog(ERROR, "there is not a active portal");
+
+	if (c->nread == c->processed)
+	{
+		MemoryContext	oldcxt;
+		uint64		i;
+
+		/* create or reset context for tuples */
+		if (!c->tuples_cxt)
+			c->tuples_cxt = AllocSetContextCreate(c->cursor_xact_cxt,
+												  "dbms_sql tuples context",
+		  										  ALLOCSET_DEFAULT_SIZES);
+		else
+			MemoryContextReset(c->tuples_cxt);
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connact failed");
+
+		/* try to fetch data from cursor */
+		SPI_cursor_fetch(c->portal, true, 10);
+
+		if (SPI_tuptable == NULL)
+			elog(ERROR, "cannot fetch data");
+
+		oldcxt = MemoryContextSwitchTo(c->tuples_cxt);
+
+		c->tupdesc = CreateTupleDescCopy(SPI_tuptable->tupdesc);
+
+		for (i = 0; i < SPI_processed; i++)
+			c->tuples[i] = heap_copytuple(SPI_tuptable->vals[i]);
+
+		MemoryContextSwitchTo(oldcxt);
+
+		c->processed = SPI_processed;
+		c->nread = 0;
+
+		SPI_finish();
+	}
+
+	if (c->nread <= c->processed)
+		c->nread += 1;
+
+	PG_RETURN_INT32(c->nread <= c->processed ? 1 : 0);
+}
+
+/*
+ * Initialize cast case entry.
+ */
+static void
+init_cast_cache_entry(CastCacheData *ccast,
+					  Oid targettypid,
+					  int32 targettypmod,
+					  Oid sourcetypid)
+{
+	Oid		funcoid;
+	Oid		basetypid;
+
+	basetypid = getBaseType(targettypid);
+
+	ccast->check_domain = basetypid != targettypid;
+
+	if (sourcetypid == basetypid)
+		ccast->without_cast = targettypmod == -1;
+	else
+		ccast->without_cast = false;
+
+	if (!ccast->without_cast)
+	{
+		ccast->path = find_coercion_pathway(targettypid,
+											sourcetypid,
+											COERCION_ASSIGNMENT,
+											&funcoid);
+
+		if (ccast->path == COERCION_PATH_NONE)
+			elog(ERROR, "cannot to find cast from source type to target type");
+
+		if (ccast->path == COERCION_PATH_FUNC)
+		{
+			fmgr_info(funcoid, &ccast->finfo);
+		}
+		else if (ccast->path == COERCION_PATH_COERCEVIAIO)
+		{
+			bool	typisvarlena;
+
+			getTypeOutputInfo(sourcetypid, &funcoid, &typisvarlena);
+			fmgr_info(funcoid, &ccast->finfo_out);
+
+			getTypeInputInfo(basetypid, &funcoid, &ccast->typIOParam);
+			fmgr_info(funcoid, &ccast->finfo_in);
+		}
+
+		if (targettypmod != -1)
+		{
+			ccast->path_typmod = find_typmod_coercion_function(targettypid,
+															   &funcoid);
+			if (ccast->path_typmod == COERCION_PATH_FUNC)
+				fmgr_info(funcoid, &ccast->finfo_typmod);
+		}
+	}
+
+	ccast->isvalid = true;
+}
+
+/*
+ * CREATE PROCEDURE dbms_sql.column_value(c int, pos int, INOUT value "any");
+ */
+Datum
+dbms_sql_column_value(PG_FUNCTION_ARGS)
+{
+	Datum		value;
+	Datum		result;
+	CursorData *c;
+	int			pos;
+	int32		columnTypeMode;
+	bool		isnull;
+	Oid			targetTypeId;
+	Oid			resultTypeId;
+	Oid			columnTypeId;
+	TupleDesc	resulttupdesc;
+	HeapTuple	resulttuple;
+	CastCacheData *ccast;
+	Oid			typoid;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connact failed");
+
+	c = get_cursor(fcinfo, true);
+
+	if (!c->executed)
+		elog(ERROR, "cursor is not executed");
+
+	if (!c->tupdesc)
+		elog(ERROR, "cursor is not fetched");
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "position is NULL");
+
+	pos = PG_GETARG_INT32(1);
+
+	if (!c->coltupdesc)
+		elog(ERROR, "there are not defined columns");
+
+	if (pos < 1 && pos > c->coltupdesc->natts)
+		elog(ERROR, "position is out of [1, %d]", c->coltupdesc->natts);
+
+	/* Setting of OUT field is little bit more complex */
+	if (get_call_result_type(fcinfo, &resultTypeId, &resulttupdesc) == TYPEFUNC_COMPOSITE)
+	{
+
+		/* check target types */
+		if (resulttupdesc->natts != 1)
+			elog(ERROR, "unexpected number of result compisite fields");
+
+		targetTypeId = get_fn_expr_argtype(fcinfo->flinfo, 2);
+		Assert((TupleDescAttr(resulttupdesc, 0))->atttypid == targetTypeId);
+
+		columnTypeId = (TupleDescAttr(c->coltupdesc, pos - 1))->atttypid;
+		columnTypeMode = (TupleDescAttr(c->coltupdesc, pos - 1))->atttypmod;
+
+		/* Maybe it can be solved by uncached slower cast */
+		if (targetTypeId != columnTypeId)
+			elog(ERROR, "internal: expected type and tupdesc are not consistent %d %d", targetTypeId, columnTypeId);
+	}
+	else
+		elog(ERROR, "unexpected function result type");
+
+	Assert(c->casts);
+
+	value = SPI_getbinval(c->tuples[c->nread - 1], c->tupdesc, pos, &isnull);
+	typoid = SPI_gettypeid(c->tupdesc, pos);
+
+	ccast = &c->casts[pos - 1];
+
+	if (!ccast->isvalid)
+		init_cast_cache_entry(ccast,
+							  columnTypeId,
+							  columnTypeMode,
+							  typoid);
+
+	if (!ccast->without_cast)
+	{
+		if (!isnull)
+		{
+			if (ccast->path == COERCION_PATH_FUNC)
+				value = FunctionCall1(&ccast->finfo, value);
+			else if (ccast->path == COERCION_PATH_RELABELTYPE)
+				value = value;
+			else if (ccast->path == COERCION_PATH_COERCEVIAIO)
+			{
+				char *str;
+
+				str = OutputFunctionCall(&ccast->finfo_out, value);
+				value = InputFunctionCall(&ccast->finfo_in,
+										  str,
+										  ccast->typIOParam,
+										  columnTypeMode);
+			}
+			else
+				elog(ERROR, "unsupported cast yet %d", ccast->path);
+
+			if (columnTypeMode != -1 && ccast->path_typmod == COERCION_PATH_FUNC)
+				value = FunctionCall3(&ccast->finfo_typmod,
+									  value,
+									  Int32GetDatum(columnTypeMode),
+									  BoolGetDatum(true));
+		}
+	}
+
+	if (ccast->check_domain)
+		domain_check(value, isnull, columnTypeId, NULL, NULL);
+
+	resulttuple = heap_form_tuple(resulttupdesc, &value, &isnull);
+	result = PointerGetDatum(SPI_returntuple(resulttuple, CreateTupleDescCopy(resulttupdesc)));
+
+	SPI_finish();
+
+	PG_RETURN_DATUM(result);
 }
 
 
@@ -595,7 +946,7 @@ is_identif(unsigned char c)
 		return true;
 	else if (c >= 'A' && c <= 'Z')
 		return true;
-	else if (c >= 128 && c <= 255)
+	else if (c >= 0200)
 		return true;
 	else
 		return false;
@@ -721,6 +1072,13 @@ next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, siz
 		return str;
 	}
 
+	/* Double colon :: */
+	if (*str == ':' && str[1] == ':')
+	{
+		*start = str; *typ = TOKEN_DOUBLE_COLON; *len = 2;
+		return str + 2;
+	}
+
 	/* Bind variable placeholder */
 	if (*str == ':' &&
 		(is_identif(str[1]) || str[1] == '_'))
@@ -747,7 +1105,7 @@ next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, siz
 		{
 			if (*str == '\'')
 			{
-				*typ = 6; *len = str - *start;
+				*typ = TOKEN_EXT_STR; *len = str - *start;
 				return str + 1;
 			}
 			if (*str == '\\' && str[1] == '\'')
@@ -757,6 +1115,7 @@ next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, siz
 			else
 				str += 1;
 		}
+
 		*typ = TOKEN_EXT_STR; *len = str - *start;
 		return str;
 	}
@@ -771,7 +1130,7 @@ next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, siz
 			{
 				if (str[1] != '\'')
 				{
-					*typ = 7; *len = str - *start;
+					*typ = TOKEN_STR; *len = str - *start;
 					return str + 1;
 				}
 				str += 2;
@@ -793,7 +1152,7 @@ next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, siz
 			{
 				if (str[1] != '"')
 				{
-					*typ = 8; *len = str - *start;
+					*typ = TOKEN_QIDENTIF; *len = str - *start;
 					return str + 1;
 				}
 				str += 2;

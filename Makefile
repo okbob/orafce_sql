@@ -5,6 +5,8 @@ OBJS = dbms_sql.o
 DATA = dbms_sql--1.0.sql
 EXTENSION = dbms_sql
 
+REGRESS = init dbms_sql
+
 ifdef NO_PGXS
 subdir = contrib/dbms_sql
 top_builddir = ../..
@@ -15,3 +17,6 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 endif
+
+override CFLAGS += -Wextra
+
