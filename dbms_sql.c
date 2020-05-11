@@ -15,7 +15,6 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
-
 PG_MODULE_MAGIC;
 
 #define MAX_CURSORS			100
@@ -85,6 +84,7 @@ typedef struct
 	MemoryContext cursor_cxt;
 	MemoryContext cursor_xact_cxt;
 	MemoryContext tuples_cxt;
+	MemoryContext result_cxt;		/* short life memory context */
 	HeapTuple	tuples[1000];
 	TupleDesc	coltupdesc;
 	TupleDesc	tupdesc;
@@ -124,6 +124,7 @@ PG_FUNCTION_INFO_V1(dbms_sql_define_column);
 PG_FUNCTION_INFO_V1(dbms_sql_execute);
 PG_FUNCTION_INFO_V1(dbms_sql_fetch_rows);
 PG_FUNCTION_INFO_V1(dbms_sql_column_value);
+PG_FUNCTION_INFO_V1(dbms_sql_column_value_f);
 
 PG_FUNCTION_INFO_V1(dbms_sql_debug_cursor);
 
@@ -615,6 +616,10 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 		c->tuples_cxt = NULL;
 	}
 
+	c->result_cxt = AllocSetContextCreate(TopTransactionContext,
+															   "dbms_sql short life context",
+															   ALLOCSET_DEFAULT_SIZES);
+
 	/*
 	 * When column definitions are available, build final query
 	 * and open cursor for fetching.
@@ -840,29 +845,17 @@ init_cast_cache_entry(CastCacheData *ccast,
 }
 
 /*
- * CREATE PROCEDURE dbms_sql.column_value(c int, pos int, INOUT value "any");
+ * CALL statement is relatily slow in PLpgSQL - due repated parsing, planning.
+ * So I wrote two variant of this routine.
  */
-Datum
-dbms_sql_column_value(PG_FUNCTION_ARGS)
+static Datum
+column_value(CursorData *c, int pos, Oid targetTypeId, bool *isnull)
 {
 	Datum		value;
-	Datum		result;
-	CursorData *c;
-	int			pos;
 	int32		columnTypeMode;
-	bool		isnull;
-	Oid			targetTypeId;
-	Oid			resultTypeId;
 	Oid			columnTypeId;
-	TupleDesc	resulttupdesc;
-	HeapTuple	resulttuple;
 	CastCacheData *ccast;
 	Oid			typoid;
-
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connact failed");
-
-	c = get_cursor(fcinfo, true);
 
 	if (!c->executed)
 		elog(ERROR, "cursor is not executed");
@@ -870,43 +863,24 @@ dbms_sql_column_value(PG_FUNCTION_ARGS)
 	if (!c->tupdesc)
 		elog(ERROR, "cursor is not fetched");
 
-	if (PG_ARGISNULL(1))
-		elog(ERROR, "position is NULL");
-
-	pos = PG_GETARG_INT32(1);
-
 	if (!c->coltupdesc)
 		elog(ERROR, "there are not defined columns");
 
 	if (pos < 1 && pos > c->coltupdesc->natts)
 		elog(ERROR, "position is out of [1, %d]", c->coltupdesc->natts);
 
-	/*
-	 * Setting of OUT field is little bit more complex, because although
-	 * there is only one output field, the result should be compisite type.
-	 */
-	if (get_call_result_type(fcinfo, &resultTypeId, &resulttupdesc) == TYPEFUNC_COMPOSITE)
-	{
-		/* check target types */
-		if (resulttupdesc->natts != 1)
-			elog(ERROR, "unexpected number of result compisite fields");
+	columnTypeId = (TupleDescAttr(c->coltupdesc, pos - 1))->atttypid;
+	columnTypeMode = (TupleDescAttr(c->coltupdesc, pos - 1))->atttypmod;
 
-		targetTypeId = get_fn_expr_argtype(fcinfo->flinfo, 2);
-		Assert((TupleDescAttr(resulttupdesc, 0))->atttypid == targetTypeId);
-
-		columnTypeId = (TupleDescAttr(c->coltupdesc, pos - 1))->atttypid;
-		columnTypeMode = (TupleDescAttr(c->coltupdesc, pos - 1))->atttypmod;
-
-		/* Maybe it can be solved by uncached slower cast */
-		if (targetTypeId != columnTypeId)
-			elog(ERROR, "internal: expected type and tupdesc are not consistent %d %d", targetTypeId, columnTypeId);
-	}
-	else
-		elog(ERROR, "unexpected function result type");
+	/* Maybe it can be solved by uncached slower cast */
+	if (targetTypeId != columnTypeId)
+		elog(ERROR, "expected type \"%s\" is different then current type \"%s\"",
+				  format_type_be(targetTypeId),
+				  format_type_be(columnTypeId));
 
 	Assert(c->casts);
 
-	value = SPI_getbinval(c->tuples[c->nread - 1], c->tupdesc, pos, &isnull);
+	value = SPI_getbinval(c->tuples[c->nread - 1], c->tupdesc, pos, isnull);
 	typoid = SPI_gettypeid(c->tupdesc, pos);
 
 	ccast = &c->casts[pos - 1];
@@ -919,7 +893,7 @@ dbms_sql_column_value(PG_FUNCTION_ARGS)
 
 	if (!ccast->without_cast)
 	{
-		if (!isnull)
+		if (!*isnull)
 		{
 			if (ccast->path == COERCION_PATH_FUNC)
 				value = FunctionCall1(&ccast->finfo, value);
@@ -947,16 +921,109 @@ dbms_sql_column_value(PG_FUNCTION_ARGS)
 	}
 
 	if (ccast->check_domain)
-		domain_check(value, isnull, columnTypeId, NULL, NULL);
+		domain_check(value, *isnull, columnTypeId, NULL, NULL);
+
+	return value;
+}
+
+/*
+ * CREATE PROCEDURE dbms_sql.column_value(c int, pos int, INOUT value "any");
+ * Note - CALL statement is slow from PLpgSQL block (against function execution).
+ * This is reason why this routine is in function form too.
+ */
+Datum
+dbms_sql_column_value(PG_FUNCTION_ARGS)
+{
+	CursorData *c;
+	Datum		value;
+	Datum		result;
+	int			pos;
+	bool		isnull;
+	Oid			targetTypeId;
+	Oid			resultTypeId;
+	TupleDesc	resulttupdesc;
+	HeapTuple	resulttuple;
+	MemoryContext	oldcxt;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connact failed");
+
+	c = get_cursor(fcinfo, true);
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "position is NULL");
+
+	pos = PG_GETARG_INT32(1);
+
+	oldcxt = MemoryContextSwitchTo(c->result_cxt);
+
+	/*
+	 * Setting of OUT field is little bit more complex, because although
+	 * there is only one output field, the result should be compisite type.
+	 */
+	if (get_call_result_type(fcinfo, &resultTypeId, &resulttupdesc) == TYPEFUNC_COMPOSITE)
+	{
+		/* check target types */
+		if (resulttupdesc->natts != 1)
+			elog(ERROR, "unexpected number of result compisite fields");
+
+		targetTypeId = get_fn_expr_argtype(fcinfo->flinfo, 2);
+		Assert((TupleDescAttr(resulttupdesc, 0))->atttypid == targetTypeId);
+	}
+	else
+		elog(ERROR, "unexpected function result type");
+
+	value = column_value(c, pos, targetTypeId, &isnull);
 
 	resulttuple = heap_form_tuple(resulttupdesc, &value, &isnull);
 	result = PointerGetDatum(SPI_returntuple(resulttuple, CreateTupleDescCopy(resulttupdesc)));
 
 	SPI_finish();
 
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(c->result_cxt);
+
 	PG_RETURN_DATUM(result);
 }
 
+/*
+ * CREATE FUNCTION dbms_sql.column_value(c int, pos int, value anyelement) RETURNS anyelement;
+ * Note - CALL statement is slow from PLpgSQL block (against function execution).
+ * This is reason why this routine is in function form too.
+ */
+Datum
+dbms_sql_column_value_f(PG_FUNCTION_ARGS)
+{
+	CursorData *c;
+	Datum		value;
+	int			pos;
+	bool		isnull;
+	Oid			targetTypeId;
+	MemoryContext	oldcxt;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connact failed");
+
+	c = get_cursor(fcinfo, true);
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "position is NULL");
+
+	pos = PG_GETARG_INT32(1);
+
+	oldcxt = MemoryContextSwitchTo(c->result_cxt);
+
+	targetTypeId = get_fn_expr_argtype(fcinfo->flinfo, 2);
+
+	value = column_value(c, pos, targetTypeId, &isnull);
+
+	SPI_finish();
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(c->result_cxt);
+
+	PG_RETURN_DATUM(value);
+}
 
 /******************************************************************
  * Simple parser - just for replacement of bind variables by

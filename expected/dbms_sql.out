@@ -50,3 +50,55 @@ NOTICE:  c1: ahoj27, c2: 27
 NOTICE:  c1: ahoj28, c2: 28
 NOTICE:  c1: ahoj29, c2: 29
 NOTICE:  c1: ahoj30, c2: 30
+do $$
+declare
+  c int;
+  strval varchar;
+  intval int;
+  nrows int default 30;
+begin
+  c := dbms_sql.open_cursor();
+  call dbms_sql.parse(c, 'select ''ahoj'' || i, i from generate_series(1, :nrows) g(i)');
+  call dbms_sql.bind_variable(c, 'nrows', nrows);
+  call dbms_sql.define_column(c, 1, strval);
+  call dbms_sql.define_column(c, 2, intval);
+  perform dbms_sql.execute(c);
+  while dbms_sql.fetch_rows(c) > 0
+  loop
+    strval := dbms_sql.column_value_f(c, 1, strval);
+    intval := dbms_sql.column_value_f(c, 2, intval);
+    raise notice 'c1: %, c2: %', strval, intval;
+  end loop;
+  call dbms_sql.close_cursor(c);
+end;
+$$;
+NOTICE:  c1: ahoj1, c2: 1
+NOTICE:  c1: ahoj2, c2: 2
+NOTICE:  c1: ahoj3, c2: 3
+NOTICE:  c1: ahoj4, c2: 4
+NOTICE:  c1: ahoj5, c2: 5
+NOTICE:  c1: ahoj6, c2: 6
+NOTICE:  c1: ahoj7, c2: 7
+NOTICE:  c1: ahoj8, c2: 8
+NOTICE:  c1: ahoj9, c2: 9
+NOTICE:  c1: ahoj10, c2: 10
+NOTICE:  c1: ahoj11, c2: 11
+NOTICE:  c1: ahoj12, c2: 12
+NOTICE:  c1: ahoj13, c2: 13
+NOTICE:  c1: ahoj14, c2: 14
+NOTICE:  c1: ahoj15, c2: 15
+NOTICE:  c1: ahoj16, c2: 16
+NOTICE:  c1: ahoj17, c2: 17
+NOTICE:  c1: ahoj18, c2: 18
+NOTICE:  c1: ahoj19, c2: 19
+NOTICE:  c1: ahoj20, c2: 20
+NOTICE:  c1: ahoj21, c2: 21
+NOTICE:  c1: ahoj22, c2: 22
+NOTICE:  c1: ahoj23, c2: 23
+NOTICE:  c1: ahoj24, c2: 24
+NOTICE:  c1: ahoj25, c2: 25
+NOTICE:  c1: ahoj26, c2: 26
+NOTICE:  c1: ahoj27, c2: 27
+NOTICE:  c1: ahoj28, c2: 28
+NOTICE:  c1: ahoj29, c2: 29
+NOTICE:  c1: ahoj30, c2: 30
