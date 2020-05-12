@@ -251,3 +251,29 @@ select * from foo;
 (3 rows)
 
 truncate foo;
+do $$
+declare c int;
+  a int[];
+  b varchar[];
+  ca numeric[];
+begin
+  c := dbms_sql.open_cursor();
+  call dbms_sql.parse(c, 'insert into foo values(:a, :b, :c)');
+  a := ARRAY[1, 2, 3, 4, 5];
+  b := ARRAY['Ahoj', 'Nazdar', 'Bazar'];
+  ca := ARRAY[3.14, 2.22, 3.8, 4];
+
+  call dbms_sql.bind_array(c, 'a', a, 2, 3);
+  call dbms_sql.bind_array(c, 'b', b, 3, 4);
+  call dbms_sql.bind_array(c, 'c', ca);
+  raise notice 'inserted rows %d', dbms_sql.execute(c);
+end;
+$$;
+NOTICE:  inserted rows 1d
+select * from foo;
+ a |   b   |  c  
+---+-------+-----
+ 3 | Bazar | 3.8
+(1 row)
+
+truncate foo;

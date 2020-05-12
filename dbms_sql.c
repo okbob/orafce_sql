@@ -40,8 +40,8 @@ typedef struct
 	Oid			typelemid;	/* Oid of element of a array */
 	bool		typelembyval;
 	int16		typelemlen;
-	int			index_min;
-	int			index_max;
+	int			index1;
+	int			index2;
 } VariableData;
 
 /*
@@ -130,6 +130,7 @@ PG_FUNCTION_INFO_V1(dbms_sql_parse);
 PG_FUNCTION_INFO_V1(dbms_sql_bind_variable);
 PG_FUNCTION_INFO_V1(dbms_sql_bind_variable_f);
 PG_FUNCTION_INFO_V1(dbms_sql_bind_array_3);
+PG_FUNCTION_INFO_V1(dbms_sql_bind_array_5);
 PG_FUNCTION_INFO_V1(dbms_sql_define_column);
 PG_FUNCTION_INFO_V1(dbms_sql_execute);
 PG_FUNCTION_INFO_V1(dbms_sql_fetch_rows);
@@ -508,11 +509,8 @@ dbms_sql_bind_variable_f(PG_FUNCTION_ARGS)
 	return bind_variable(fcinfo);
 }
 
-/*
- * CREATE PROCEDURE dbms_sql.bind_array(c int, name varchar2, value anyarray);
- */
-Datum
-dbms_sql_bind_array_3(PG_FUNCTION_ARGS)
+static void
+bind_array(FunctionCallInfo fcinfo, int index1, int index2)
 {
 	CursorData *c;
 	VariableData *var;
@@ -568,6 +566,43 @@ dbms_sql_bind_array_3(PG_FUNCTION_ARGS)
 	}
 	else
 		var->isnull = true;
+
+	var->index1 = index1;
+	var->index2 = index2;
+}
+
+/*
+ * CREATE PROCEDURE dbms_sql.bind_array(c int, name varchar2, value anyarray);
+ */
+Datum
+dbms_sql_bind_array_3(PG_FUNCTION_ARGS)
+{
+	bind_array(fcinfo, -1, -1);
+
+	return (Datum) 0;
+}
+
+/*
+ * CREATE PROCEDURE dbms_sql.bind_array(c int, name varchar2, value anyarray, index1 int, index2 int);
+ */
+Datum
+dbms_sql_bind_array_5(PG_FUNCTION_ARGS)
+{
+	int		index1, index2;
+
+	if (PG_ARGISNULL(3) || PG_ARGISNULL(4))
+		elog(ERROR, "index is NULL");
+
+	index1 = PG_GETARG_INT32(3);
+	index2 = PG_GETARG_INT32(4);
+
+	if (index1 < 0 || index2 < 0)
+		elog(ERROR, "index is below zero");
+
+	if (index1 > index2)
+		elog(ERROR, "index1 is greater index2");
+
+	bind_array(fcinfo, index1, index2);
 
 	return (Datum) 0;
 }
@@ -827,14 +862,18 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 	}
 	else
 	{
+		MemoryContext oldcxt;
 		Datum	   *values;
 		char	   *nulls;
 		ArrayIterator *iterators;
+		bool		has_iterator = false;
+		bool		has_value = true;
+		int			max_index1 = -1;
+		int			min_index2 = -1;
+		int			max_rows = -1;
+		long		result = 0;
 		ListCell   *lc;
 		int			i;
-		long		result = 0;
-		bool		has_iterator = false;
-		MemoryContext oldcxt;
 
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connact failed");
@@ -877,27 +916,50 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 		nulls = palloc(sizeof(char) * c->nvariables);
 		iterators = palloc(sizeof(ArrayIterator *) * c->nvariables);
 
+		has_value = true;
+
 		i = 0;
 		foreach(lc, c->variables)
 		{
 			VariableData *var = (VariableData *) lfirst(lc);
 
-			if (!var->is_array)
-			{
-				values[i] = var->value;
-				nulls[i] = var->isnull ? 'n' : ' ';
-			}
-			else
+			if (var->is_array)
 			{
 				if (!var->isnull)
 				{
-					iterators[i] = array_create_iterator(DatumGetArrayTypeP(var->value), 0, NULL);
+					iterators[i] = array_create_iterator(DatumGetArrayTypeP(var->value),
+														 0,
+														 NULL);
+
+					/* search do lowest common denominator */
+					if (var->index1 != -1)
+					{
+						if (max_index1 != -1)
+						{
+							max_index1 = max_index1 < var->index1 ? var->index1 : max_index1;
+							min_index2 = min_index2 > var->index2 ? var->index2 : min_index2;
+						}
+						else
+						{
+							max_index1 = var->index1;
+							min_index2 = var->index2;
+						}
+					}
+
 					has_iterator = true;
+
 				}
 				else
 				{
-					iterators[i] = NULL;
+					/* cannot to read data from NULL array */
+					has_value = false;
+					break;
 				}
+			}
+			else
+			{
+				values[i] = var->value;
+				nulls[i] = var->isnull ? 'n' : ' ';
 			}
 
 			i += 1;
@@ -905,53 +967,81 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 
 		if (has_iterator)
 		{
-			int		rows = 0;
-		
-			while (rows++ < 10)
+			if (has_value)
 			{
-				bool		has_values;
-				Datum		value;
-				bool		isnull;
+				if (max_index1 != -1)
+				{
+					max_rows = min_index2 - max_index1 + 1;
+					has_value = max_rows > 0;
 
-				i = 0; has_values = true;
+					if (has_value && max_index1 > 1)
+					{
+						i = 0;
+						foreach(lc, c->variables)
+						{
+							VariableData *var = (VariableData *) lfirst(lc);
 
+							if (var->is_array)
+							{
+								int		j;
+
+								Assert(iterators[i]);
+
+								for (j = 1; j < max_index1; j++)
+								{
+									Datum		value;
+									bool		isnull;
+
+									has_value = array_iterate(iterators[i], &value, &isnull);
+									if (!has_value)
+										break;
+								}
+
+								if (!has_value)
+									break;
+							}
+
+							i += 1;
+						}
+					}
+				}
+			}
+
+			while (has_value && (max_rows == -1 || max_rows > 0))
+			{
+				int			rc;
+
+				i = 0;
 				foreach(lc, c->variables)
 				{
 					VariableData *var = (VariableData *) lfirst(lc);
 
 					if (var->is_array)
 					{
-						if (iterators[i])
-						{
-							has_values = array_iterate(iterators[i], &value, &isnull);
-							if (!has_values)
-								break;
+						Datum		value;
+						bool		isnull;
 
-							values[i] = value;
-							nulls[i] = isnull ? 'n' : ' ';
-						}
-						else
-						{
-							has_values = false;
+						has_value = array_iterate(iterators[i], &value, &isnull);
+						if (!has_value)
 							break;
-						}
+
+						values[i] = value;
+						nulls[i] = isnull ? 'n' : ' ';
 					}
 
 					i += 1;
 				}
-
-				if (has_values)
-				{
-					int			rc;
-
-					rc = SPI_execute_plan(c->plan, values, nulls, false, 0);
-					if (rc < 0)
-						elog(ERROR, "cannot to execute a query");
-
-					result += SPI_processed;
-				}
-				else
+				if (!has_value)
 					break;
+
+				rc = SPI_execute_plan(c->plan, values, nulls, false, 0);
+				if (rc < 0)
+					elog(ERROR, "cannot to execute a query");
+
+				result += SPI_processed;
+
+				if (max_rows > 0)
+					max_rows -= 1;
 			}
 
 			MemoryContextReset(c->result_cxt);
