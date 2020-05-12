@@ -9,6 +9,7 @@
 #include "nodes/pg_list.h"
 #include "parser/parse_coerce.h"
 #include "parser/scansup.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/elog.h"
@@ -35,6 +36,12 @@ typedef struct
 
 	bool		isnull;
 	int			varno;		/* number of assigned placeholder of parsed query */
+	bool		is_array;	/* true, when a value is assigned via bind_array */
+	Oid			typelemid;	/* Oid of element of a array */
+	bool		typelembyval;
+	int16		typelemlen;
+	int			index_min;
+	int			index_max;
 } VariableData;
 
 /*
@@ -80,7 +87,8 @@ typedef struct
 	List	   *variables;
 	List	   *columns;
 	char		cursorname[32];
-	Portal		portal;
+	Portal		portal;				/* one shot (execute) plan */
+	SPIPlanPtr	plan;
 	MemoryContext cursor_cxt;
 	MemoryContext cursor_xact_cxt;
 	MemoryContext tuples_cxt;
@@ -120,6 +128,8 @@ PG_FUNCTION_INFO_V1(dbms_sql_open_cursor);
 PG_FUNCTION_INFO_V1(dbms_sql_close_cursor);
 PG_FUNCTION_INFO_V1(dbms_sql_parse);
 PG_FUNCTION_INFO_V1(dbms_sql_bind_variable);
+PG_FUNCTION_INFO_V1(dbms_sql_bind_variable_f);
+PG_FUNCTION_INFO_V1(dbms_sql_bind_array_3);
 PG_FUNCTION_INFO_V1(dbms_sql_define_column);
 PG_FUNCTION_INFO_V1(dbms_sql_execute);
 PG_FUNCTION_INFO_V1(dbms_sql_fetch_rows);
@@ -207,6 +217,9 @@ close_cursor(CursorData *c)
 
 	if (c->cursor_xact_cxt)
 		MemoryContextDelete(c->cursor_xact_cxt);
+
+	if (c->plan)
+		SPI_freeplan(c->plan);
 
 	memset(c, 0, sizeof(CursorData));
 }
@@ -410,10 +423,10 @@ dbms_sql_parse(PG_FUNCTION_ARGS)
 }
 
 /*
- * CREATE PROCEDURE dbms_sql.bind_variable(c int, name varchar2, value "any");
+ * Calling procedure can be slow, so there is a function alternative
  */
-Datum
-dbms_sql_bind_variable(PG_FUNCTION_ARGS)
+static Datum
+bind_variable(PG_FUNCTION_ARGS)
 {
 	CursorData *c;
 	VariableData *var;
@@ -466,6 +479,90 @@ dbms_sql_bind_variable(PG_FUNCTION_ARGS)
 			var->value = CStringGetTextDatum(DatumGetPointer(PG_GETARG_DATUM(2)));
 		else
 			var->value = datumCopy(PG_GETARG_DATUM(2), var->typbyval, var->typlen);
+
+		var->isnull = false;
+
+		MemoryContextSwitchTo(oldcxt);
+	}
+	else
+		var->isnull = true;
+
+	return (Datum) 0;
+}
+
+/*
+ * CREATE PROCEDURE dbms_sql.bind_variable(c int, name varchar2, value "any");
+ */
+Datum
+dbms_sql_bind_variable(PG_FUNCTION_ARGS)
+{
+	return bind_variable(fcinfo);
+}
+
+/*
+ * CREATE FUNCTION dbms_sql.bind_variable_f(c int, name varchar2, value "any") RETURNS void;
+ */
+Datum
+dbms_sql_bind_variable_f(PG_FUNCTION_ARGS)
+{
+	return bind_variable(fcinfo);
+}
+
+/*
+ * CREATE PROCEDURE dbms_sql.bind_array(c int, name varchar2, value anyarray);
+ */
+Datum
+dbms_sql_bind_array_3(PG_FUNCTION_ARGS)
+{
+	CursorData *c;
+	VariableData *var;
+	char *varname, *varname_downcase;
+	Oid			valtype;
+	Oid			elementtype;
+	bool		is_unknown = false;
+
+	c = get_cursor(fcinfo, true);
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "name is NULL");
+
+	varname = text_to_cstring(PG_GETARG_TEXT_P(1));
+	if (*varname == ':')
+		varname += 1;
+
+	varname_downcase = downcase_identifier(varname, strlen(varname), false, true);
+	var = get_var(c, varname_downcase, -1, false);
+
+	valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+	if (valtype == RECORDOID)
+		elog(ERROR, "cannot to assign a value of record type");
+
+	valtype = getBaseType(valtype);
+	elementtype = get_element_type(valtype);
+
+	if (!OidIsValid(elementtype))
+		elog(ERROR, "argument is not a array");
+
+	var->is_array = true;
+	var->typoid = valtype;
+	var->typelemid = elementtype;
+
+	get_typlenbyval(elementtype, &var->typelemlen, &var->typelembyval);
+
+	if (!PG_ARGISNULL(2))
+	{
+		MemoryContext	oldcxt;
+
+		get_typlenbyval(var->typoid, &var->typlen, &var->typbyval);
+
+		oldcxt = MemoryContextSwitchTo(c->cursor_cxt);
+
+		if (is_unknown)
+			var->value = CStringGetTextDatum(DatumGetPointer(PG_GETARG_DATUM(2)));
+		else
+			var->value = datumCopy(PG_GETARG_DATUM(2), var->typbyval, var->typlen);
+
+		var->isnull = false;
 
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -622,7 +719,9 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 
 	/*
 	 * When column definitions are available, build final query
-	 * and open cursor for fetching.
+	 * and open cursor for fetching. When column definitions are
+	 * missing, then the statement can be called with high frequency
+	 * etc INSERT, UPDATE, so use cached plan.
 	 */
 	if (c->columns)
 	{
@@ -645,6 +744,9 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 		{
 			VariableData *var = (VariableData *) lfirst(lc);
 
+			if (var->is_array)
+				elog(ERROR, "bind array variables are not supported when data columns are defined");
+
 			if (!var->isnull)
 			{
 				/* copy a value to xact memory context, to be independent on a outside */
@@ -658,12 +760,12 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 				elog(ERROR, "variable \"%s\" has not bind a value", var->refname);
 
 			types[i] = var->typoid;
+			i += 1;
 		}
 
 		/* prepare or refresh target tuple descriptor, used for final tupconversion */
 		if (c->tupdesc)
 			FreeTupleDesc(c->tupdesc);
-
 
 		c->coltupdesc = CreateTemplateTupleDesc(c->max_colpos);
 
@@ -723,6 +825,154 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 
 		c->executed = true;
 	}
+	else
+	{
+		Datum	   *values;
+		char	   *nulls;
+		ArrayIterator *iterators;
+		ListCell   *lc;
+		int			i;
+		long		result = 0;
+		bool		has_iterator = false;
+		MemoryContext oldcxt;
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connact failed");
+
+		/* prepare, or reuse cached plan */
+		if (!c->plan)
+		{
+			Oid			   *types = NULL;
+			SPIPlanPtr		plan;
+
+			types = palloc(sizeof(Oid) * c->nvariables);
+
+			i = 0;
+			foreach(lc, c->variables)
+			{
+				VariableData *var = (VariableData *) lfirst(lc);
+
+				if (var->typoid == InvalidOid)
+					elog(ERROR, "variable \"%s\" has not bind a value", var->refname);
+
+				types[i++] = var->is_array ? var->typelemid : var->typoid;
+			}
+
+			plan = SPI_prepare(c->parsed_query, c->nvariables, types);
+			if (!plan)
+				elog(ERROR, "cannot to prepare plan");
+
+			if (types)
+				pfree(types);
+
+			SPI_keepplan(plan);
+
+			c->plan = plan;
+		}
+
+		oldcxt = MemoryContextSwitchTo(c->result_cxt);
+
+		/* prepare query arguments */
+		values = palloc(sizeof(Datum) * c->nvariables);
+		nulls = palloc(sizeof(char) * c->nvariables);
+		iterators = palloc(sizeof(ArrayIterator *) * c->nvariables);
+
+		i = 0;
+		foreach(lc, c->variables)
+		{
+			VariableData *var = (VariableData *) lfirst(lc);
+
+			if (!var->is_array)
+			{
+				values[i] = var->value;
+				nulls[i] = var->isnull ? 'n' : ' ';
+			}
+			else
+			{
+				if (!var->isnull)
+				{
+					iterators[i] = array_create_iterator(DatumGetArrayTypeP(var->value), 0, NULL);
+					has_iterator = true;
+				}
+				else
+				{
+					iterators[i] = NULL;
+				}
+			}
+
+			i += 1;
+		}
+
+		if (has_iterator)
+		{
+			int		rows = 0;
+		
+			while (rows++ < 10)
+			{
+				bool		has_values;
+				Datum		value;
+				bool		isnull;
+
+				i = 0; has_values = true;
+
+				foreach(lc, c->variables)
+				{
+					VariableData *var = (VariableData *) lfirst(lc);
+
+					if (var->is_array)
+					{
+						if (iterators[i])
+						{
+							has_values = array_iterate(iterators[i], &value, &isnull);
+							if (!has_values)
+								break;
+
+							values[i] = value;
+							nulls[i] = isnull ? 'n' : ' ';
+						}
+						else
+						{
+							has_values = false;
+							break;
+						}
+					}
+
+					i += 1;
+				}
+
+				if (has_values)
+				{
+					int			rc;
+
+					rc = SPI_execute_plan(c->plan, values, nulls, false, 0);
+					if (rc < 0)
+						elog(ERROR, "cannot to execute a query");
+
+					result += SPI_processed;
+				}
+				else
+					break;
+			}
+
+			MemoryContextReset(c->result_cxt);
+		}
+		else
+		{
+			int			rc;
+
+			rc = SPI_execute_plan(c->plan, values, nulls, false, 0);
+			if (rc < 0)
+				elog(ERROR, "cannot to execute a query");
+
+			result = SPI_processed;
+		}
+
+		SPI_finish();
+
+		MemoryContextSwitchTo(oldcxt);
+
+		PG_RETURN_INT64(result);
+	}
 
 	PG_RETURN_INT64(0);
 }
@@ -752,7 +1002,7 @@ dbms_sql_fetch_rows(PG_FUNCTION_ARGS)
 		if (!c->tuples_cxt)
 			c->tuples_cxt = AllocSetContextCreate(c->cursor_xact_cxt,
 												  "dbms_sql tuples context",
-		  										  ALLOCSET_DEFAULT_SIZES);
+												  ALLOCSET_DEFAULT_SIZES);
 		else
 			MemoryContextReset(c->tuples_cxt);
 
@@ -1024,6 +1274,9 @@ dbms_sql_column_value_f(PG_FUNCTION_ARGS)
 
 	PG_RETURN_DATUM(value);
 }
+
+
+
 
 /******************************************************************
  * Simple parser - just for replacement of bind variables by

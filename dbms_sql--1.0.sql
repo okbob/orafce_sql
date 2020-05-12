@@ -14,6 +14,8 @@ CREATE PROCEDURE dbms_sql.close_cursor(c int) AS 'MODULE_PATHNAME', 'dbms_sql_cl
 CREATE PROCEDURE dbms_sql.debug_cursor(c int) AS 'MODULE_PATHNAME', 'dbms_sql_debug_cursor' LANGUAGE c;
 CREATE PROCEDURE dbms_sql.parse(c int, stmt varchar2) AS 'MODULE_PATHNAME', 'dbms_sql_parse' LANGUAGE c;
 CREATE PROCEDURE dbms_sql.bind_variable(c int, name varchar2, value "any") AS 'MODULE_PATHNAME', 'dbms_sql_bind_variable' LANGUAGE c;
+CREATE FUNCTION dbms_sql.bind_variable_f(c int, name varchar2, value "any") RETURNS void AS 'MODULE_PATHNAME', 'dbms_sql_bind_variable_f' LANGUAGE c;
+CREATE PROCEDURE dbms_sql.bind_array(c int, name varchar2, value anyarray) AS 'MODULE_PATHNAME', 'dbms_sql_bind_array_3' LANGUAGE c;
 CREATE PROCEDURE dbms_sql.define_column(c int, col int, value "any", size int DEFAULT -1) AS 'MODULE_PATHNAME', 'dbms_sql_define_column' LANGUAGE c;
 CREATE FUNCTION dbms_sql.execute(c int) RETURNS bigint AS 'MODULE_PATHNAME', 'dbms_sql_execute' LANGUAGE c;
 CREATE FUNCTION dbms_sql.fetch_rows(c int) RETURNS int AS 'MODULE_PATHNAME', 'dbms_sql_fetch_rows' LANGUAGE c;
