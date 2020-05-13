@@ -1608,6 +1608,7 @@ dbms_sql_column_value_f(PG_FUNCTION_ARGS)
 	pos = PG_GETARG_INT32(1);
 
 	oldcxt = MemoryContextSwitchTo(c->result_cxt);
+	MemoryContextReset(c->result_cxt);
 
 	targetTypeId = get_fn_expr_argtype(fcinfo->flinfo, 2);
 
@@ -1616,7 +1617,6 @@ dbms_sql_column_value_f(PG_FUNCTION_ARGS)
 	SPI_finish();
 
 	MemoryContextSwitchTo(oldcxt);
-	MemoryContextReset(c->result_cxt);
 
 	PG_RETURN_DATUM(value);
 }
