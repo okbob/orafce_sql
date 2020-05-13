@@ -1457,6 +1457,7 @@ column_value(CursorData *c, int pos, Oid targetTypeId, bool *isnull)
 	if (bms_is_member(pos, c->array_columns))
 	{
 		ArrayBuildState *abs;
+		int		idx;
 		int		i;
 
 		Oid bctype = getBaseType(columnTypeId);
@@ -1469,7 +1470,7 @@ column_value(CursorData *c, int pos, Oid targetTypeId, bool *isnull)
 
 		abs = initArrayResult(columnTypeId, CurrentMemoryContext, false);
 
-		int		idx = c->start_read;
+		idx = c->start_read;
 
 		for (i = 0; i < c->batch_rows; i++)
 		{
@@ -1536,6 +1537,7 @@ dbms_sql_column_value(PG_FUNCTION_ARGS)
 	pos = PG_GETARG_INT32(1);
 
 	oldcxt = MemoryContextSwitchTo(c->result_cxt);
+	MemoryContextReset(c->result_cxt);
 
 	/*
 	 * Setting of OUT field is little bit more complex, because although
@@ -1561,7 +1563,6 @@ dbms_sql_column_value(PG_FUNCTION_ARGS)
 	SPI_finish();
 
 	MemoryContextSwitchTo(oldcxt);
-	MemoryContextReset(c->result_cxt);
 
 	PG_RETURN_DATUM(result);
 }
