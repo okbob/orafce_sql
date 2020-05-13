@@ -56,12 +56,17 @@ typedef struct
 	int16		typlen;
 	int32		typmod;
 	bool		typisstr;
+	Oid			typarrayoid;		/* oid of requested array output value */
+	int			rowcount;			/* maximal rows of requested array */
+	int			index1;				/* output array should be rewrited from this index */
 } ColumnData;
 
 typedef struct
 {
 	bool		isvalid;			/* true, when this cast can be used */
 	bool		without_cast;		/* true, when cast is not necessary */
+	Oid		targettypid;			/* used for domains */
+	int32	targettypmod;			/* used for strings */
 	Oid		funcoid;
 	Oid		funcoid_typmod;
 	CoercionPathType path;
@@ -71,7 +76,6 @@ typedef struct
 	FmgrInfo	finfo_out;
 	FmgrInfo	finfo_in;
 	Oid			typIOParam;
-	bool		check_domain;
 } CastCacheData;
 
 /*
@@ -99,8 +103,11 @@ typedef struct
 	CastCacheData *casts;
 	int			processed;
 	int			nread;
+	int			start_read;
 	bool		assigned;
 	bool		executed;
+	Bitmapset  *array_columns;		/* set of array columns */
+	int			batch_rows;			/* how much rows should be fetched to fill target arrays */
 } CursorData;
 
 typedef enum
@@ -124,6 +131,7 @@ static CursorData		cursors[MAX_CURSORS];
 
 static char *next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, size_t *seplen);
 
+PG_FUNCTION_INFO_V1(dbms_sql_is_open);
 PG_FUNCTION_INFO_V1(dbms_sql_open_cursor);
 PG_FUNCTION_INFO_V1(dbms_sql_close_cursor);
 PG_FUNCTION_INFO_V1(dbms_sql_parse);
@@ -132,14 +140,19 @@ PG_FUNCTION_INFO_V1(dbms_sql_bind_variable_f);
 PG_FUNCTION_INFO_V1(dbms_sql_bind_array_3);
 PG_FUNCTION_INFO_V1(dbms_sql_bind_array_5);
 PG_FUNCTION_INFO_V1(dbms_sql_define_column);
+PG_FUNCTION_INFO_V1(dbms_sql_define_array);
 PG_FUNCTION_INFO_V1(dbms_sql_execute);
 PG_FUNCTION_INFO_V1(dbms_sql_fetch_rows);
+PG_FUNCTION_INFO_V1(dbms_sql_execute_and_fetch);
 PG_FUNCTION_INFO_V1(dbms_sql_column_value);
 PG_FUNCTION_INFO_V1(dbms_sql_column_value_f);
+PG_FUNCTION_INFO_V1(dbms_sql_last_row_count);
 
 PG_FUNCTION_INFO_V1(dbms_sql_debug_cursor);
 
 void _PG_init(void);
+
+static int last_row_count = 0;
 
 void
 _PG_init(void)
@@ -205,6 +218,20 @@ get_cursor(FunctionCallInfo fcinfo, bool should_be_assigned)
 
 	return cursor;
 }
+
+/*
+ * CREATE FUNCTION dbms_sql.is_open(c int) RETURNS bool;
+ */
+Datum
+dbms_sql_is_open(PG_FUNCTION_ARGS)
+{
+	CursorData	   *c;
+
+	c = get_cursor(fcinfo, false);
+
+	PG_RETURN_BOOL(c->assigned);
+}
+
 
 static void
 close_cursor(CursorData *c)
@@ -650,6 +677,7 @@ dbms_sql_define_column(PG_FUNCTION_ARGS)
 	CursorData *c;
 	ColumnData *col;
 	Oid			valtype;
+	Oid			basetype;
 	int		position;
 	int		colsize;
 	TYPCATEGORY category;
@@ -667,9 +695,10 @@ dbms_sql_define_column(PG_FUNCTION_ARGS)
 	if (valtype == RECORDOID)
 		elog(ERROR, "cannot to define a column of record type");
 
-	valtype = getBaseType(valtype);
 	if (valtype == UNKNOWNOID)
 		valtype = TEXTOID;
+
+	basetype = getBaseType(valtype);
 
 	if (col->typoid != InvalidOid)
 		elog(WARNING, "column is defined already");
@@ -681,9 +710,81 @@ dbms_sql_define_column(PG_FUNCTION_ARGS)
 
 	colsize = PG_GETARG_INT32(3);
 
-	get_type_category_preferred(col->typoid, &category, &ispreferred);
+	get_type_category_preferred(basetype, &category, &ispreferred);
 	col->typisstr = category == TYPCATEGORY_STRING;
 	col->typmod = (col->typisstr && colsize != -1) ? colsize + 4 : -1;
+
+	get_typlenbyval(basetype, &col->typlen, &col->typbyval);
+
+	return (Datum) 0;
+}
+
+/*
+ * CREATE PROCEDURE dbms_sql.define_array(c int, col int, value "anyarray", rowcount int, index1 int);
+ */
+Datum
+dbms_sql_define_array(PG_FUNCTION_ARGS)
+{
+	CursorData *c;
+	ColumnData *col;
+	Oid			valtype;
+	Oid			basetype;
+	int		position;
+	int		rowcount;
+	int		index1;
+	Oid		elementtype;
+	TYPCATEGORY category;
+	bool	ispreferred;
+
+	c = get_cursor(fcinfo, true);
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "position is NULL");
+
+	position = PG_GETARG_INT32(1);
+	col = get_col(c, position, true);
+
+	valtype = get_fn_expr_argtype(fcinfo->flinfo, 2);
+	if (valtype == RECORDOID)
+		elog(ERROR, "cannot to define a column of record type");
+
+	get_type_category_preferred(valtype, &category, &ispreferred);
+	if (category != TYPCATEGORY_ARRAY)
+		elog(ERROR, "defined value is not array");
+
+	col->typarrayoid = valtype;
+
+	basetype = getBaseType(valtype);
+	elementtype = get_element_type(basetype);
+
+	if (!OidIsValid(elementtype))
+		elog(ERROR, "column is not a array");
+
+	if (col->typoid != InvalidOid)
+		elog(WARNING, "column is defined already");
+
+	col->typoid = elementtype;
+
+	if (PG_ARGISNULL(3))
+		elog(ERROR, "rowcount is NULL");
+
+	rowcount = PG_GETARG_INT32(3);
+	if (rowcount <= 0)
+		elog(ERROR, "rowcount should be greater than zero");
+
+	col->rowcount = rowcount;
+
+	if (PG_ARGISNULL(4))
+		elog(ERROR, "index1 is NULL");
+
+	index1 = PG_GETARG_INT32(4);
+	if (index1 < 1)
+		elog(ERROR, "index should greater than zero");
+
+	if (index1 != 1)
+		elog(ERROR, "index should to be 1 only (other value is not supported yet)");
+
+	col->index1 = index1;
 
 	get_typlenbyval(col->typoid, &col->typlen, &col->typbyval);
 
@@ -704,17 +805,13 @@ cursor_xact_cxt_deletion_callback(void *arg)
 	cur->tupdesc = NULL;
 	cur->coltupdesc = NULL;
 	cur->casts = NULL;
+	cur->array_columns = NULL;
 }
 
-/*
- * CREATE FUNCTION dbms_sql.execute(c int) RETURNS bigint;
- */
-Datum
-dbms_sql_execute(PG_FUNCTION_ARGS)
+static long
+execute(CursorData *c)
 {
-	CursorData *c;
-
-	c = get_cursor(fcinfo, true);
+	last_row_count = 0;
 
 	/* clean space with saved result */
 	if (!c->cursor_xact_cxt)
@@ -766,6 +863,7 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 		ListCell   *lc;
 		int		i;
 		MemoryContext oldcxt;
+		int			batch_rows = -1;
 
 		oldcxt = MemoryContextSwitchTo(c->cursor_xact_cxt);
 
@@ -811,9 +909,26 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 			char genname[32];
 
 			snprintf(genname, 32, "col%d", i);
+
+			if (col->typarrayoid)
+			{
+				if (batch_rows != -1)
+					batch_rows = batch_rows > col->rowcount ? col->rowcount : batch_rows;
+				else
+					batch_rows = col->rowcount;
+
+				c->array_columns = bms_add_member(c->array_columns, i);
+			}
+			else
+			{
+				/* in this case we cannot do batch of rows */
+				batch_rows = 1;
+			}
+
 			TupleDescInitEntry(c->coltupdesc, (AttrNumber) i, genname, col->typoid, col->typmod, 0);
 		}
 
+		c->batch_rows = batch_rows;
 		c->casts = palloc0(sizeof(CastCacheData) * c->coltupdesc->natts);
 
 		MemoryContextSwitchTo(oldcxt);
@@ -1061,21 +1176,29 @@ dbms_sql_execute(PG_FUNCTION_ARGS)
 
 		MemoryContextSwitchTo(oldcxt);
 
-		PG_RETURN_INT64(result);
+		return result;
 	}
 
-	PG_RETURN_INT64(0);
+	return 0L;
 }
 
 /*
- * CREATE FUNCTION dbms_sql.fetch_rows(c int) RETURNS int;
+ * CREATE FUNCTION dbms_sql.execute(c int) RETURNS bigint;
  */
 Datum
-dbms_sql_fetch_rows(PG_FUNCTION_ARGS)
+dbms_sql_execute(PG_FUNCTION_ARGS)
 {
 	CursorData *c;
 
 	c = get_cursor(fcinfo, true);
+
+	PG_RETURN_INT64(execute(c));
+}
+
+static int
+fetch_rows(CursorData *c, bool exact)
+{
+	int		can_read_rows;
 
 	if (!c->executed)
 		elog(ERROR, "cursor is not executed");
@@ -1087,6 +1210,17 @@ dbms_sql_fetch_rows(PG_FUNCTION_ARGS)
 	{
 		MemoryContext	oldcxt;
 		uint64		i;
+		int			batch_rows;
+
+		if (!exact)
+		{
+			if (c->array_columns)
+				batch_rows = (1000 / c->batch_rows) * c->batch_rows;
+			else
+				batch_rows = 1000;
+		}
+		else
+			batch_rows = 2;
 
 		/* create or reset context for tuples */
 		if (!c->tuples_cxt)
@@ -1100,10 +1234,13 @@ dbms_sql_fetch_rows(PG_FUNCTION_ARGS)
 			elog(ERROR, "SPI_connact failed");
 
 		/* try to fetch data from cursor */
-		SPI_cursor_fetch(c->portal, true, 10);
+		SPI_cursor_fetch(c->portal, true, batch_rows);
 
 		if (SPI_tuptable == NULL)
 			elog(ERROR, "cannot fetch data");
+
+		if (exact && SPI_processed != 1)
+			elog(ERROR, "exact fetch returns different more or less rows than one");
 
 		oldcxt = MemoryContextSwitchTo(c->tuples_cxt);
 
@@ -1120,10 +1257,62 @@ dbms_sql_fetch_rows(PG_FUNCTION_ARGS)
 		SPI_finish();
 	}
 
-	if (c->nread <= c->processed)
-		c->nread += 1;
+	if (c->processed - c->nread >= c->batch_rows)
+		can_read_rows = c->batch_rows;
+	else
+		can_read_rows = c->processed - c->nread;
 
-	PG_RETURN_INT32(c->nread <= c->processed ? 1 : 0);
+	c->start_read = c->nread;
+	c->nread += can_read_rows;
+
+	last_row_count = can_read_rows;
+
+	return can_read_rows;
+}
+
+/*
+ * CREATE FUNCTION dbms_sql.fetch_rows(c int) RETURNS int;
+ */
+Datum
+dbms_sql_fetch_rows(PG_FUNCTION_ARGS)
+{
+	CursorData *c;
+
+	c = get_cursor(fcinfo, true);
+
+	PG_RETURN_INT32(fetch_rows(c, false));
+}
+
+/*
+ * CREATE FUNCTION dbms_sql.execute_and_fetch(c int, exact bool DEFAULT false) RETURNS int;
+ */
+Datum
+dbms_sql_execute_and_fetch(PG_FUNCTION_ARGS)
+{
+	CursorData *c;
+	bool		exact;
+
+	c = get_cursor(fcinfo, true);
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "argument is NULL");
+
+	exact = PG_GETARG_BOOL(1);
+
+	execute(c);
+
+	PG_RETURN_INT32(fetch_rows(c, exact));
+}
+
+/*
+ * CREATE FUNCTION dbms_sql.last_row_count() RETURNS int;
+ */
+Datum
+dbms_sql_last_row_count(PG_FUNCTION_ARGS)
+{
+	(void) fcinfo;
+
+	PG_RETURN_INT32(last_row_count);
 }
 
 /*
@@ -1140,16 +1329,21 @@ init_cast_cache_entry(CastCacheData *ccast,
 
 	basetypid = getBaseType(targettypid);
 
-	ccast->check_domain = basetypid != targettypid;
+	if (targettypid != basetypid)
+		ccast->targettypid = targettypid;
+	else
+		ccast->targettypid = InvalidOid;
 
-	if (sourcetypid == basetypid)
+	ccast->targettypmod = targettypmod;
+
+	if (sourcetypid == targettypid)
 		ccast->without_cast = targettypmod == -1;
 	else
 		ccast->without_cast = false;
 
 	if (!ccast->without_cast)
 	{
-		ccast->path = find_coercion_pathway(targettypid,
+		ccast->path = find_coercion_pathway(basetypid,
 											sourcetypid,
 											COERCION_ASSIGNMENT,
 											&funcoid);
@@ -1168,7 +1362,7 @@ init_cast_cache_entry(CastCacheData *ccast,
 			getTypeOutputInfo(sourcetypid, &funcoid, &typisvarlena);
 			fmgr_info(funcoid, &ccast->finfo_out);
 
-			getTypeInputInfo(basetypid, &funcoid, &ccast->typIOParam);
+			getTypeInputInfo(targettypid, &funcoid, &ccast->typIOParam);
 			fmgr_info(funcoid, &ccast->finfo_in);
 		}
 
@@ -1185,6 +1379,44 @@ init_cast_cache_entry(CastCacheData *ccast,
 }
 
 /*
+ * Apply cast rules to a value
+ */
+static Datum
+cast_value(CastCacheData *ccast, Datum value, bool isnull)
+{
+	if (!isnull && !ccast->without_cast)
+	{
+		if (ccast->path == COERCION_PATH_FUNC)
+			value = FunctionCall1(&ccast->finfo, value);
+		else if (ccast->path == COERCION_PATH_RELABELTYPE)
+			value = value;
+		else if (ccast->path == COERCION_PATH_COERCEVIAIO)
+		{
+			char *str;
+
+			str = OutputFunctionCall(&ccast->finfo_out, value);
+			value = InputFunctionCall(&ccast->finfo_in,
+									  str,
+									  ccast->typIOParam,
+									  ccast->targettypmod);
+		}
+		else
+			elog(ERROR, "unsupported cast yet %d", ccast->path);
+
+		if (ccast->targettypmod != -1 && ccast->path_typmod == COERCION_PATH_FUNC)
+			value = FunctionCall3(&ccast->finfo_typmod,
+								  value,
+								  Int32GetDatum(ccast->targettypmod),
+								  BoolGetDatum(true));
+	}
+
+	if (ccast->targettypid != InvalidOid)
+		domain_check(value, isnull, ccast->targettypid, NULL, NULL);
+
+	return value;
+}
+
+/*
  * CALL statement is relatily slow in PLpgSQL - due repated parsing, planning.
  * So I wrote two variant of this routine.
  */
@@ -1195,7 +1427,6 @@ column_value(CursorData *c, int pos, Oid targetTypeId, bool *isnull)
 	int32		columnTypeMode;
 	Oid			columnTypeId;
 	CastCacheData *ccast;
-	Oid			typoid;
 
 	if (!c->executed)
 		elog(ERROR, "cursor is not executed");
@@ -1212,56 +1443,65 @@ column_value(CursorData *c, int pos, Oid targetTypeId, bool *isnull)
 	columnTypeId = (TupleDescAttr(c->coltupdesc, pos - 1))->atttypid;
 	columnTypeMode = (TupleDescAttr(c->coltupdesc, pos - 1))->atttypmod;
 
-	/* Maybe it can be solved by uncached slower cast */
-	if (targetTypeId != columnTypeId)
-		elog(ERROR, "expected type \"%s\" is different then current type \"%s\"",
-				  format_type_be(targetTypeId),
-				  format_type_be(columnTypeId));
-
 	Assert(c->casts);
-
-	value = SPI_getbinval(c->tuples[c->nread - 1], c->tupdesc, pos, isnull);
-	typoid = SPI_gettypeid(c->tupdesc, pos);
-
 	ccast = &c->casts[pos - 1];
 
 	if (!ccast->isvalid)
+	{
 		init_cast_cache_entry(ccast,
 							  columnTypeId,
 							  columnTypeMode,
-							  typoid);
-
-	if (!ccast->without_cast)
-	{
-		if (!*isnull)
-		{
-			if (ccast->path == COERCION_PATH_FUNC)
-				value = FunctionCall1(&ccast->finfo, value);
-			else if (ccast->path == COERCION_PATH_RELABELTYPE)
-				value = value;
-			else if (ccast->path == COERCION_PATH_COERCEVIAIO)
-			{
-				char *str;
-
-				str = OutputFunctionCall(&ccast->finfo_out, value);
-				value = InputFunctionCall(&ccast->finfo_in,
-										  str,
-										  ccast->typIOParam,
-										  columnTypeMode);
-			}
-			else
-				elog(ERROR, "unsupported cast yet %d", ccast->path);
-
-			if (columnTypeMode != -1 && ccast->path_typmod == COERCION_PATH_FUNC)
-				value = FunctionCall3(&ccast->finfo_typmod,
-									  value,
-									  Int32GetDatum(columnTypeMode),
-									  BoolGetDatum(true));
-		}
+							  SPI_gettypeid(c->tupdesc, pos));
 	}
 
-	if (ccast->check_domain)
-		domain_check(value, *isnull, columnTypeId, NULL, NULL);
+	if (bms_is_member(pos, c->array_columns))
+	{
+		ArrayBuildState *abs;
+		int		i;
+
+		Oid bctype = getBaseType(columnTypeId);
+		Oid batype = getBaseType(targetTypeId);
+
+		if (get_array_type(bctype) != batype)
+			elog(ERROR, "expected type \"%s\" is different then current type \"%s\"",
+					  format_type_be(get_array_type(bctype)),
+					  format_type_be(batype));
+
+		abs = initArrayResult(columnTypeId, CurrentMemoryContext, false);
+
+		int		idx = c->start_read;
+
+		for (i = 0; i < c->batch_rows; i++)
+		{
+			if (idx < c->processed)
+			{
+				value = SPI_getbinval(c->tuples[idx], c->tupdesc, pos, isnull);
+				value = cast_value(ccast, value, *isnull);
+
+				abs = accumArrayResult(abs,
+									   value,
+									   *isnull,
+									   columnTypeId,
+									   CurrentMemoryContext);
+
+				idx += 1;
+			}
+		}
+
+		value = makeArrayResult(abs, CurrentMemoryContext);
+	}
+	else
+	{
+		/* Maybe it can be solved by uncached slower cast */
+		if (targetTypeId != columnTypeId)
+			elog(ERROR, "expected type \"%s\" is different then current type \"%s\"",
+					  format_type_be(targetTypeId),
+					  format_type_be(columnTypeId));
+
+		value = SPI_getbinval(c->tuples[c->start_read], c->tupdesc, pos, isnull);
+
+		value = cast_value(ccast, value, *isnull);
+	}
 
 	return value;
 }
@@ -1364,9 +1604,6 @@ dbms_sql_column_value_f(PG_FUNCTION_ARGS)
 
 	PG_RETURN_DATUM(value);
 }
-
-
-
 
 /******************************************************************
  * Simple parser - just for replacement of bind variables by
