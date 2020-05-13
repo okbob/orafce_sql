@@ -2,6 +2,13 @@
 #include "fmgr.h"
 #include "funcapi.h"
 
+#if PG_VERSION_NUM < 120000
+
+#include "access/htup_details.h"
+
+#endif
+
+
 #include "access/tupconvert.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
@@ -900,7 +907,15 @@ execute(CursorData *c)
 		if (c->tupdesc)
 			FreeTupleDesc(c->tupdesc);
 
+#if PG_VERSION_NUM >= 120000
+
 		c->coltupdesc = CreateTemplateTupleDesc(c->max_colpos);
+
+#else
+
+		c->coltupdesc = CreateTemplateTupleDesc(c->max_colpos, false);
+
+#endif
 
 		/* prepare current result column tupdesc */
 		for (i = 1; i <= c->max_colpos; i++)
