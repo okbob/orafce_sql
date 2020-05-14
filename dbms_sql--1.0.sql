@@ -18,8 +18,8 @@ CREATE PROCEDURE dbms_sql.bind_variable(c int, name varchar2, value "any") AS 'M
 CREATE FUNCTION dbms_sql.bind_variable_f(c int, name varchar2, value "any") RETURNS void AS 'MODULE_PATHNAME', 'dbms_sql_bind_variable_f' LANGUAGE c;
 CREATE PROCEDURE dbms_sql.bind_array(c int, name varchar2, value anyarray) AS 'MODULE_PATHNAME', 'dbms_sql_bind_array_3' LANGUAGE c;
 CREATE PROCEDURE dbms_sql.bind_array(c int, name varchar2, value anyarray, index1 int, index2 int) AS 'MODULE_PATHNAME', 'dbms_sql_bind_array_5' LANGUAGE c;
-CREATE PROCEDURE dbms_sql.define_column(c int, col int, value "any", size int DEFAULT -1) AS 'MODULE_PATHNAME', 'dbms_sql_define_column' LANGUAGE c;
-CREATE PROCEDURE dbms_sql.define_array(c int, col int, value "anyarray", rowcount int, index1 int) AS 'MODULE_PATHNAME', 'dbms_sql_define_array' LANGUAGE c;
+CREATE PROCEDURE dbms_sql.define_column(c int, col int, value "any", column_size int DEFAULT -1) AS 'MODULE_PATHNAME', 'dbms_sql_define_column' LANGUAGE c;
+CREATE PROCEDURE dbms_sql.define_array(c int, col int, value "anyarray", cnt int, lower_bnd int) AS 'MODULE_PATHNAME', 'dbms_sql_define_array' LANGUAGE c;
 CREATE FUNCTION dbms_sql.execute(c int) RETURNS bigint AS 'MODULE_PATHNAME', 'dbms_sql_execute' LANGUAGE c;
 CREATE FUNCTION dbms_sql.fetch_rows(c int) RETURNS int AS 'MODULE_PATHNAME', 'dbms_sql_fetch_rows' LANGUAGE c;
 CREATE FUNCTION dbms_sql.execute_and_fetch(c int, exact bool DEFAULT false) RETURNS int AS 'MODULE_PATHNAME', 'dbms_sql_execute_and_fetch' LANGUAGE c;
