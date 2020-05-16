@@ -896,8 +896,8 @@ execute(CursorData *c)
 		MemoryContext oldcxt;
 
 		c->cursor_xact_cxt = AllocSetContextCreate(TopTransactionContext,
-															   "dbms_sql persist context",
-															   ALLOCSET_DEFAULT_SIZES);
+												   "dbms_sql transaction context",
+												   ALLOCSET_DEFAULT_SIZES);
 
 		oldcxt = MemoryContextSwitchTo(c->cursor_xact_cxt);
 		mcb = palloc0(sizeof(MemoryContextCallback));
@@ -921,9 +921,9 @@ execute(CursorData *c)
 		c->tuples_cxt = NULL;
 	}
 
-	c->result_cxt = AllocSetContextCreate(TopTransactionContext,
-															   "dbms_sql short life context",
-															   ALLOCSET_DEFAULT_SIZES);
+	c->result_cxt = AllocSetContextCreate(c->cursor_xact_cxt,
+										  "dbms_sql short life context",
+										  ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * When column definitions are available, build final query
