@@ -1465,7 +1465,7 @@ init_cast_cache_entry(CastCacheData *ccast,
 		if (ccast->path == COERCION_PATH_NONE)
 			ereport(ERROR,
 			    (errcode(ERRCODE_CANNOT_COERCE),
-			     errmsg("cannot to find cast from source type \"%s\"to target type \"%s\"",
+			     errmsg("cannot to find cast from source type \"%s\" to target type \"%s\"",
 						 format_type_be(sourcetypid),
 						 format_type_be(basetypid))));
 

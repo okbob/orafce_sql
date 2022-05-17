@@ -65,3 +65,7 @@ Oracle's applications to Postgres. Some basic bulk DML functionality is supporte
 
 When you plan to use dbms_sql extension together with Orafce, then you have to remove line
 with `CREATE DOMAIN varchar2 AS text;` statement from install sql script.
+
+## ToDo
+
+* DESCRIBE_COLUMNS
