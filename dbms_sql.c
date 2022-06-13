@@ -10,6 +10,7 @@
 
 #include "access/tupconvert.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
@@ -20,7 +21,10 @@
 #include "utils/datum.h"
 #include "utils/elog.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 #include "utils/memutils.h"
+#include "utils/typcache.h"
+#include "executor/spi_priv.h"
 
 PG_MODULE_MAGIC;
 
@@ -147,6 +151,26 @@ static CursorData		cursors[MAX_CURSORS];
 
 static char *next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, size_t *seplen);
 
+PGDLLEXPORT Datum dbms_sql_is_open(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_open_cursor(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_close_cursor(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_parse(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_bind_variable(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_bind_variable_f(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_bind_array_3(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_bind_array_5(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_define_column(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_define_array(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_execute(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_fetch_rows(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_execute_and_fetch(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_column_value(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_column_value_f(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_last_row_count(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_describe_columns(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_describe_columns_f(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum dbms_sql_debug_cursor(PG_FUNCTION_ARGS);
+
 PG_FUNCTION_INFO_V1(dbms_sql_is_open);
 PG_FUNCTION_INFO_V1(dbms_sql_open_cursor);
 PG_FUNCTION_INFO_V1(dbms_sql_close_cursor);
@@ -163,8 +187,10 @@ PG_FUNCTION_INFO_V1(dbms_sql_execute_and_fetch);
 PG_FUNCTION_INFO_V1(dbms_sql_column_value);
 PG_FUNCTION_INFO_V1(dbms_sql_column_value_f);
 PG_FUNCTION_INFO_V1(dbms_sql_last_row_count);
-
+PG_FUNCTION_INFO_V1(dbms_sql_describe_columns);
+PG_FUNCTION_INFO_V1(dbms_sql_describe_columns_f);
 PG_FUNCTION_INFO_V1(dbms_sql_debug_cursor);
+
 
 void _PG_init(void);
 
@@ -2017,4 +2043,197 @@ next_token(char *str, char **start, size_t *len, TokenType *typ, char **sep, siz
 	/* Others */
 	*typ = TOKEN_OTHER; *start = str; *len = 1;
 	return str + 1;
+}
+
+/*
+ * CREATE PROCEDURE dbms_sql.describe_columns(c int, OUT col_cnt int, OUT desc_t dbms_sql.desc_rec[])
+ *
+ * Returns an array of column's descriptions. Attention, the typid are related to PostgreSQL type
+ * system.
+ */
+Datum
+dbms_sql_describe_columns(PG_FUNCTION_ARGS)
+{
+	CursorData *c;
+	Datum		values[13];
+	bool		nulls[13];
+	TupleDesc	tupdesc;
+	TupleDesc	desc_rec_tupdesc;
+	TupleDesc	cursor_tupdesc;
+	HeapTuple	tuple;
+	Oid			arraytypid;
+	Oid			desc_rec_typid;
+	Oid		   *types = NULL;
+	ArrayBuildState *abuilder;
+	SPIPlanPtr		plan;
+	CachedPlanSource *plansource = NULL;
+	int			ncolumns = 0;
+	int			rc;
+	int			i = 0;
+	bool		nonatomic;
+	MemoryContext callercxt = CurrentMemoryContext;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	arraytypid = TupleDescAttr(tupdesc, 1)->atttypid;
+	desc_rec_typid = get_element_type(arraytypid);
+
+	if (!OidIsValid(desc_rec_typid))
+		elog(ERROR, "second output field must be an array");
+
+	desc_rec_tupdesc = lookup_rowtype_tupdesc_copy(desc_rec_typid, -1);
+
+	abuilder = initArrayResult(desc_rec_typid, callercxt, true);
+
+	c = get_cursor(fcinfo, true);
+
+	if (c->variables)
+	{
+		ListCell *lc;
+
+		types = palloc(sizeof(Oid) * c->nvariables);
+		i = 0;
+
+		foreach(lc, c->variables)
+		{
+			VariableData *var = (VariableData *) lfirst(lc);
+
+			if (var->typoid == InvalidOid)
+				ereport(ERROR,
+					    (errcode(ERRCODE_UNDEFINED_PARAMETER),
+					     errmsg("variable \"%s\" has not a value", var->refname)));
+
+			types[i++] = var->is_array ? var->typelemid : var->typoid;
+		}
+	}
+
+	/*
+	 * Connect to SPI manager
+	 */
+	nonatomic = fcinfo->context &&
+		IsA(fcinfo->context, CallContext) &&
+		!castNode(CallContext, fcinfo->context)->atomic;
+
+	if ((rc = SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0)) != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+
+	plan = SPI_prepare(c->parsed_query, c->nvariables, types);
+	if (!plan || plan->magic != _SPI_PLAN_MAGIC)
+		elog(ERROR, "plan is not valid");
+
+	if (list_length(plan->plancache_list) != 1)
+		elog(ERROR, "plan is not single execution plany");
+
+	plansource = (CachedPlanSource *) linitial(plan->plancache_list);
+	cursor_tupdesc = plansource->resultDesc;
+
+	ncolumns = cursor_tupdesc->natts;
+
+	for (i = 0; i < ncolumns; i++)
+	{
+		HeapTuple	tp;
+		Form_pg_type typtup;
+		text	*txt;
+
+		Form_pg_attribute attr = TupleDescAttr(cursor_tupdesc, i);
+
+		/*
+		 * 0. col_type            BINARY_INTEGER := 0,
+		 * 1. col_max_len         BINARY_INTEGER := 0,
+		 * 2. col_name            VARCHAR2(32)   := '',
+		 * 3. col_name_len        BINARY_INTEGER := 0,
+		 * 4. col_schema_name     VARCHAR2(32)   := '',
+		 * 5. col_schema_name_len BINARY_INTEGER := 0,
+		 * 6. col_precision       BINARY_INTEGER := 0,
+		 * 7. col_scale           BINARY_INTEGER := 0,
+		 * 8. col_charsetid       BINARY_INTEGER := 0,
+		 * 9. col_charsetform     BINARY_INTEGER := 0,
+		 * 10. col_null_ok        BOOLEAN        := TRUE
+		 * 11. col_type_name      varchar2       := '',
+		 * 12. col_type_name_len  BINARY_INTEGER := 0 );
+		 */
+
+		values[0] = Int32GetDatum(attr->atttypid);
+
+		tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(attr->atttypid));
+		if (!HeapTupleIsValid(tp))
+			elog(ERROR, "cache lookup failed for type %u", attr->atttypid);
+
+		typtup = (Form_pg_type) GETSTRUCT(tp);
+
+		values[1] = Int32GetDatum(0);
+		values[6] = Int32GetDatum(0);
+		values[7] = Int32GetDatum(0);
+
+		if (attr->attlen != -1)
+			values[1] = Int32GetDatum(attr->attlen);
+		else if (typtup->typcategory == 'S' && attr->atttypmod > VARHDRSZ)
+			values[1] = Int32GetDatum(attr->atttypmod - VARHDRSZ);
+		else if (attr->atttypid == NUMERICOID && attr->atttypmod > VARHDRSZ)
+		{
+			values[6] = Int32GetDatum(((attr->atttypmod - VARHDRSZ) >> 16) & 0xffff);
+			values[7] = Int32GetDatum((((attr->atttypmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024);
+		}
+
+		txt = cstring_to_text(NameStr(attr->attname));
+		values[2] = PointerGetDatum(txt);
+		values[3] = DirectFunctionCall1(textlen, PointerGetDatum(txt));
+
+		txt = cstring_to_text(get_namespace_name(typtup->typnamespace));
+		values[4] = PointerGetDatum(txt);
+		values[5] = DirectFunctionCall1(textlen, PointerGetDatum(txt));
+
+		values[8] = Int32GetDatum(0);
+		values[9] = Int32GetDatum(0);
+
+		values[10] = BoolGetDatum(true);
+
+		if (attr->attnotnull)
+			values[10] = BoolGetDatum(false);
+		else if (typtup->typnotnull)
+			values[10] = BoolGetDatum(false);
+
+		txt = cstring_to_text(NameStr(typtup->typname));
+		values[11] = PointerGetDatum(txt);
+		values[12] = DirectFunctionCall1(textlen, PointerGetDatum(txt));
+
+		memset(nulls, 0, sizeof(nulls));
+
+		tuple = heap_form_tuple(desc_rec_tupdesc, values, nulls);
+
+		abuilder = accumArrayResult(abuilder,
+									HeapTupleGetDatum(tuple),
+									false,
+									desc_rec_typid,
+									CurrentMemoryContext);
+
+		ReleaseSysCache(tp);
+	}
+
+	SPI_freeplan(plan);
+
+	if ((rc = SPI_finish()) != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed: %s", SPI_result_code_string(rc));
+
+	MemoryContextSwitchTo(callercxt);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, 0, sizeof(nulls));
+
+	values[0] = Int32GetDatum(ncolumns);
+	nulls[0] = false;
+
+	values[1] = makeArrayResult(abuilder, callercxt);
+	nulls[1] = false;
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+Datum
+dbms_sql_describe_columns_f(PG_FUNCTION_ARGS)
+{
+	return dbms_sql_describe_columns(fcinfo);
 }

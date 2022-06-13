@@ -25,7 +25,7 @@ Oracle's applications to Postgres. Some basic bulk DML functionality is supporte
       a := ARRAY[1, 2, 3, 4, 5];
       b := ARRAY['Ahoj', 'Nazdar', 'Bazar'];
       ca := ARRAY[3.14, 2.22, 3.8, 4];
-    
+
       call dbms_sql.bind_array(c, 'a', a, 2, 3);
       call dbms_sql.bind_array(c, 'b', b, 3, 4);
       call dbms_sql.bind_array(c, 'c', ca);
@@ -61,11 +61,54 @@ Oracle's applications to Postgres. Some basic bulk DML functionality is supporte
     end;
     $$;
 
+There is function `dbms_sql.describe_columns_f`, that is like procedure `dbms_sql.describe_columns`.
+Attention, the type ids are related to PostgreSQL type system. The values are not converted to Oracle's
+numbers
+
+    do $$
+    declare
+      c int;
+      r record;
+      d dbms_sql.desc_rec;
+    begin
+      c := dbms_sql.open_cursor();
+      call dbms_sql.parse(c, 'select * from pg_class');
+      r := dbms_sql.describe_columns(c);
+      raise notice '%', r.col_cnt;
+
+      foreach d in array r.desc_t
+      loop
+        raise notice '% %', d.col_name, d.col_type::regtype;
+      end loop;
+
+      call dbms_sql.close_cursor(c);
+    end;
+    $$;
+
+    do $$
+    declare
+      c int;
+      n int;
+      d dbms_sql.desc_rec;
+      da dbms_sql.desc_rec[];
+    begin
+      c := dbms_sql.open_cursor();
+      call dbms_sql.parse(c, 'select * from pg_class');
+      call dbms_sql.describe_columns(c, n, da);
+      raise notice '%', n;
+
+      foreach d in array da
+      loop
+        raise notice '% %', d.col_name, d.col_type::regtype;
+      end loop;
+
+      call dbms_sql.close_cursor(c);
+    end;
+    $$;
+
 ## Dependency
 
 When you plan to use dbms_sql extension together with Orafce, then you have to remove line
 with `CREATE DOMAIN varchar2 AS text;` statement from install sql script.
 
 ## ToDo
-
-* DESCRIBE_COLUMNS
